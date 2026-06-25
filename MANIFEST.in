@@ -1,5 +1,4 @@
 include pre_reasoning/checkpoints/*.safetensors
-exclude checkpoints/*.pt
 prune __pycache__
 global-exclude *.py[cod]
 global-exclude .DS_Store
