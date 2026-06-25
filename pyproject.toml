@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pre-reasoning"
+version = "3.0.0"
+description = "12M-parameter neural pre-reasoning engine for grounding LLMs before they answer."
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+authors = [
+  { name = "Luis Lozano" },
+  { name = "Dr. Shannon (Mia Labs AI co-researcher)" },
+  { name = "Mia Labs" }
+]
+keywords = ["reasoning", "llm", "graph", "deterministic"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+  "torch>=2.0.0",
+  "safetensors>=0.4.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0.0",
+]
+
+[project.scripts]
+pre-reasoning = "pre_reasoning.cli:main"
+
+[project.urls]
+Repository = "https://github.com/luislozanogmia/pre-reasoning"
+
+[tool.setuptools]
+packages = ["pre_reasoning", "pre_reasoning.checkpoints"]
+
+[tool.setuptools.package-data]
+pre_reasoning = ["checkpoints/*.safetensors"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
