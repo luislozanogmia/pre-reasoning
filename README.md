@@ -10,11 +10,11 @@ Given natural-language problem text, the engine extracts structure across five l
 
 | Family | What it detects | Output |
 |---|---|---|
-| F1 -- Dependencies | Forward/reverse dependencies, temporal ordering, chains | ROOT BLOCKERS, UNLOCK SEQUENCE, PARALLEL WORK, CYCLES |
-| F2 -- Conflicts | Competing positions, incompatible entities | CONFLICTS with pair precision |
-| F3 -- Requirements | Numeric thresholds, operator constraints (>=, <=) | REQUIREMENTS with verdict |
-| F4 -- Conditionals | If-then edges, gated dependencies | CONDITIONAL EDGES with entity binding |
-| F5 -- Transitive Closure | Implicit assumptions from dependency chains | DERIVED ASSUMPTIONS (built-in E4 expert) |
+| F1 - Dependencies | Forward/reverse dependencies, temporal ordering, chains | ROOT BLOCKERS, UNLOCK SEQUENCE, PARALLEL WORK, CYCLES |
+| F2 - Conflicts | Competing positions, incompatible entities | CONFLICTS with pair precision |
+| F3 - Requirements | Numeric thresholds, operator constraints (>=, <=) | REQUIREMENTS with verdict |
+| F4 - Conditionals | If-then edges, gated dependencies | CONDITIONAL EDGES with entity binding |
+| F5 - Transitive Closure | Implicit assumptions from dependency chains | DERIVED ASSUMPTIONS (built-in E4 expert) |
 
 ## Install
 
@@ -59,11 +59,11 @@ The 12M MoE model passes all 35 metrics across five families. 2,250 eval example
 
 | Family | Metrics | Score |
 |---|---:|---:|
-| F1 -- Dependencies | 9 | 9/9 |
-| F2 -- Conflicts | 4 | 4/4 |
-| F3 -- Requirements | 5 | 5/5 |
-| F4 -- Conditionals | 4 | 4/4 |
-| F5 -- Transitive Closure | 4 | 4/4 |
+| F1 - Dependencies | 9 | 9/9 |
+| F2 - Conflicts | 4 | 4/4 |
+| F3 - Requirements | 5 | 5/5 |
+| F4 - Conditionals | 4 | 4/4 |
+| F5 - Transitive Closure | 4 | 4/4 |
 | Cross-Family Integrity | 9 | 9/9 |
 | **Total** | **35** | **35/35** |
 
