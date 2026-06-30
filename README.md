@@ -1,6 +1,6 @@
 # Pre-Reasoning
 
-Pre-Reasoning is a Mia Labs structural analysis engine that grounds an LLM before it answers. It uses a 12M-parameter MoE neural model to surface dependencies, derived assumptions, root blockers, unlock order, parallel work, cycles, and conflicts from problem text.
+Pre-Reasoning is a Mia Labs structural analysis engine that grounds an LLM before it answers. It uses a 13.7M trainable parameter MoE neural model to surface dependencies, derived assumptions, root blockers, unlock order, parallel work, cycles, and conflicts from problem text.
 
 The engine ships with bundled weights and declares its torch dependency; install and run, no model download needed.
 
@@ -55,7 +55,7 @@ To use a different weights file, set `PRE_REASONING_CHECKPOINT=/path/to/weights.
 
 ## Eval Results: 35/35 PASS
 
-The 12M MoE model passes all 35 metrics across five families. 2,250 eval examples, seed 7777.
+The 13.7M trainable parameter MoE model passes all 35 metrics across five families. 2,250 eval examples, seed 7777.
 
 | Family | Metrics | Score |
 |---|---:|---:|
@@ -87,7 +87,7 @@ Full task-by-task results with token counts and costs: [benchmarks/terminal_benc
 
 ```text
 User text
-  -> neural perception (12M MoE)
+  -> neural perception (13.7M MoE)
   -> neural findings converted to structural blocks
   -> built-in E4 expert infers transitive closure assumptions
   -> derived assumptions appended as dependency blocks
@@ -100,11 +100,11 @@ User text
 | Path | Purpose |
 |---|---|
 | `pre_reasoning/` | Installable Python package and CLI entry point |
-| `pre_reasoning/inference.py` | 12M-parameter MoE neural perception layer |
+| `pre_reasoning/inference.py` | 13.7M trainable parameter MoE neural perception layer |
 | `pre_reasoning/harness.py` | Graph-reasoning core |
 | `pre_reasoning/engine.py` | Default v3 engine: neural perception + built-in closure + graph reasoning |
 | `pre_reasoning/engine_core.py` | Core engine: neural perception + graph reasoning |
-| `pre_reasoning/checkpoints/pre-reasoning-12m-v3.safetensors` | Bundled model weights (84MB) |
+| `pre_reasoning/checkpoints/pre-reasoning-12m-v3.safetensors` | Bundled model weights (85MB file, 13.7M trainable parameters) |
 | `examples/` | Runnable usage examples |
 | `tests/` | Pytest suite |
 | `skill/SKILL.md` | Agent skill descriptor for model adoption |
@@ -117,7 +117,7 @@ User text
 
 ## Weights Policy
 
-The raw training checkpoint is not part of the release. The package bundles `pre_reasoning/checkpoints/pre-reasoning-12m-v3.safetensors`. This is an inference artifact. It ships no optimizer state, LR schedules, step counters, RNG state, training config, or raw checkpoint provenance.
+The raw training checkpoint is not part of the release. The package bundles `pre_reasoning/checkpoints/pre-reasoning-12m-v3.safetensors`. This is an inference artifact with 13.7M trainable parameters. The file contains 22.1M tensor values because it also stores fixed causal attention masks. It ships no optimizer state, LR schedules, step counters, RNG state, training config, or raw checkpoint provenance.
 
 ## License
 

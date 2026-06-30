@@ -48,4 +48,4 @@ print(check)
 
 If `status` is `CONTINUE`, revise the response to address the listed `gaps`, then call `pulse()` again. If `status` is `COMPLETE`, the response has addressed the detected root blockers.
 
-Bundled 12M model weights are used automatically. Set `PRE_REASONING_CHECKPOINT=/path/to/weights.safetensors` only when testing another converted weights file.
+Bundled 13.7M trainable parameter model weights are used automatically. Set `PRE_REASONING_CHECKPOINT=/path/to/weights.safetensors` only when testing another converted weights file.

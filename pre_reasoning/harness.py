@@ -16,7 +16,7 @@ The engine is pure algorithm (0 ML params). Takes L1 adapter blocks, outputs:
   - Parallel opportunity windows
   - Critical path length
 
-Pipeline: Neural perception (12M MoE) -> structural blocks -> graph reasoning (0p) -> structural trace
+Pipeline: Neural perception (13.7M MoE) -> structural blocks -> graph reasoning (0p) -> structural trace
 
 Author: Dr. Shannon, Mia Labs
 Date: 2026-03-02

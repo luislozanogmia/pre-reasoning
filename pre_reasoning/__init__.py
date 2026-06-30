@@ -28,7 +28,7 @@ def get_engine(
     checkpoint_path: Optional[str] = None,
     device: str = "auto",
 ) -> ReasoningEngineV25:
-    """Create a reasoning engine (12M neural perception + graph analysis)."""
+    """Create a reasoning engine (13.7M neural perception + graph analysis)."""
     return ReasoningEngine(
         checkpoint_path=checkpoint_path,
         device=device,

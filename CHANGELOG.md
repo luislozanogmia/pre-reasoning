@@ -2,10 +2,10 @@
 
 ## v3.0.0
 
-- Upgraded to 12M-parameter MoE model (v4, 5 expert groups) as the standalone engine.
+- Upgraded to 13.7M trainable parameter MoE model (v4, 5 expert groups) as the standalone engine.
 - Transitive closure is now computed by the built-in E4 expert. The external derive_expert package is no longer needed.
 - Renamed internal modules: engine.py (was pre_reasoning_v2_5_2.py), engine_core.py (was pre_reasoning_v2_5.py).
-- Checkpoint upgraded from 3M (11MB) to 12M (85MB).
+- Checkpoint upgraded from 3M (11MB) to 13.7M trainable parameters (85MB file, 22.1M tensor values including fixed masks).
 - Removed derive_expert sub-package from the distribution.
 - Fixed broken imports caused by the module rename.
 

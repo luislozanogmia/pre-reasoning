@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "pre-reasoning"
 version = "3.0.0"
-description = "12M-parameter neural pre-reasoning engine for grounding LLMs before they answer."
+description = "13.7M trainable parameter neural pre-reasoning engine for grounding LLMs before they answer."
 readme = "README.md"
 requires-python = ">=3.9"
 license = "MIT"

@@ -1,6 +1,6 @@
 # Eval Results
 
-12M MoE model, 35/35 PASS. Checkpoint: `pre-reasoning-12m-v3.safetensors`.
+13.7M trainable parameter MoE model, 35/35 PASS. Checkpoint: `pre-reasoning-12m-v3.safetensors`.
 
 F1-F4 evaluated on 1,650 examples (50 per category, 33 categories). F5 evaluated on 600 examples (400 YES, 200 EMPTY). Seed 7777, greedy decoding.
 

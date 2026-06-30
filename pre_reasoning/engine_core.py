@@ -472,7 +472,7 @@ def main():
 
     parser = argparse.ArgumentParser(
         prog="pre-reasoning",
-        description="Pre-Reasoning v3 -- 12M Neural Engine",
+        description="Pre-Reasoning v3, 13.7M Neural Engine",
     )
     parser.add_argument("text", nargs="?", help="Problem text to analyze")
     parser.add_argument("--checkpoint", type=str, default=None, help="Optional .safetensors weights override")

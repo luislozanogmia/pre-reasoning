@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-inference.py -- Neural perception layer (12M MoE v4)
+inference.py, Neural perception layer (13.7M MoE v4)
 ================================================
 
 Learned successor to ReasoningEngineV2 (harness/rule-based).
-12M MoE neural network brain (v4, 5 experts).
+13.7M MoE neural network brain (v4, 5 experts).
 
 TWO-PASS PIPELINE:
   PASS A  F1-F3  : b8 auto-routed MoE generate -> dependencies / conflicts /
@@ -19,7 +19,7 @@ Modes:
   sl = structural in, language out
 
 Author: Dr. Shannon, Mia Labs
-Date: 2026-06-23 (12M MoE v4)
+Date: 2026-06-23 (13.7M MoE v4)
 """
 
 import os
@@ -177,7 +177,7 @@ ID2TOKEN[HAS_ASSUMPTIONS_YES_ID] = "HAS_ASSUMPTIONS_YES"
 ID2TOKEN[HAS_ASSUMPTIONS_NO_ID] = "HAS_ASSUMPTIONS_NO"
 ID2TOKEN[CLOSURE_ASSUM_ID] = "CLOSURE_ASSUM"
 
-# ── Architecture constants (12M MoE) ─────────────────────────────────────────
+# ── Architecture constants (13.7M MoE) ───────────────────────────────────────
 D_MODEL = 288
 N_HEADS = 8
 D_FF = 1152
@@ -318,7 +318,7 @@ REQUIREMENT_LEQ_LANG_ALIASES = [
 ]
 
 
-# ── Model Architecture (12M MoE v4) ─────────────────────────────────────────
+# ── Model Architecture (13.7M MoE v4) ───────────────────────────────────────
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, d_model, n_heads, max_len, dropout=0.1):
@@ -586,7 +586,7 @@ if _TV is None:
 # ── Checkpoint loading ───────────────────────────────────────────────────────
 
 def load_model(checkpoint_path=None, device="cpu"):
-    """Load the 12M MoE model from safetensors checkpoint."""
+    """Load the 13.7M MoE model from safetensors checkpoint."""
     if checkpoint_path is None:
         checkpoint_path = os.environ.get("PRE_REASONING_CHECKPOINT", str(DEFAULT_CHECKPOINT))
     checkpoint_path = Path(checkpoint_path)
@@ -620,7 +620,7 @@ def load_model(checkpoint_path=None, device="cpu"):
         max_seq_len = MAX_SEQ_LEN
 
     meta = {
-        "variant_id": "12m_v4",
+        "variant_id": "13_7m_v4",
         "params": model.count_parameters(),
     }
     return model, _Cfg(), meta
@@ -1425,7 +1425,7 @@ def _f5_pass(model, edges, device, max_window_calls=4000):
 # ── ReasoningEngineV3 ───────────────────────────────────────────────────────
 
 class ReasoningEngineV3:
-    """Neural Reasoning Engine -- 12M MoE v4.
+    """Neural Reasoning Engine, 13.7M MoE v4.
 
     Full v3 interface with two new result keys:
       derived_assumptions  -- list of {assuming, premise} dicts from F5 closure
@@ -1448,7 +1448,7 @@ class ReasoningEngineV3:
             "engine": "ReasoningEngineV3",
             "version": self.VERSION,
             "type": "neural",
-            "model": self.meta.get("variant_id", "12m_v4"),
+            "model": self.meta.get("variant_id", "13_7m_v4"),
             "params": self.meta.get("params", 0),
             "input": {
                 "text": "Natural language describing dependencies between entities.",
@@ -1562,7 +1562,7 @@ class ReasoningEngineV3:
             for a, b in sorted(closure_pairs)
         ]
 
-        variant = "12m_v4"
+        variant = "13_7m_v4"
         params = self.model.count_parameters()
         pred_tokens_a = [ID2TOKEN.get(t, str(t)) for t in toks_a if t not in (EOS_ID, PAD_ID, 0)]
 
@@ -1608,7 +1608,7 @@ class ReasoningEngineV3:
     def derive_assumptions(self, edges):
         """F5/E4 transitive closure on a list of (src, tgt) NAME pairs (or (s, rel, t)).
 
-        This is the neural E4 closure pass built into the 12M model.
+        This is the neural E4 closure pass built into the 13.7M model.
         It maps entity names to ENT ids, runs the dedicated E4 closure pass
         (with topological canonicalization), and maps the closure back to names.
         Returns (closure_name_pairs, verdict): closure_name_pairs is a set of
@@ -1710,7 +1710,7 @@ class ReasoningEngineV3:
             impact = _compute_impact(rb, adj_forward)
             rb_list.append({"entity": rb, "name": _name(rb), "impact": impact})
 
-        variant = "12m_v4"
+        variant = "13_7m_v4"
         params = self.model.count_parameters()
         unlock_sequence = parsed_out.get("unlock_sequence", [])
         has_cycle = parsed_out.get("has_cycle", False)
@@ -1813,7 +1813,7 @@ class ReasoningEngineV3:
             "engine": "ReasoningEngineV3",
             "version": self.VERSION,
             "type": "neural",
-            "model": self.meta.get("variant_id", "12m_v4"),
+            "model": self.meta.get("variant_id", "13_7m_v4"),
             "params": self.meta.get("params", 0),
             "checkpoint": self._checkpoint_path,
             "device": self.device,
@@ -1841,7 +1841,7 @@ class ReasoningEngineV3:
             "raw_input": text[:200],
             "mode": mode,
             "inference_ms": round(elapsed * 1000, 1),
-            "model": "12m_v4",
+            "model": "13_7m_v4",
             "derived_assumptions": [],
             "transitive_closure": [],
             "assumption_verdict": None,
@@ -2010,7 +2010,7 @@ class ReasoningEngineV3:
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description="ReasoningEngineV3 -- 12M MoE Neural Reasoning")
+    parser = argparse.ArgumentParser(description="ReasoningEngineV3, 13.7M MoE Neural Reasoning")
     parser.add_argument("text", nargs="?", help="Problem text to analyze")
     parser.add_argument("--checkpoint", type=str, default=None)
     parser.add_argument("--mode", type=str, default="ll", choices=["ll", "ls", "ss", "sl"])

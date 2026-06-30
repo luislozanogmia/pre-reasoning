@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-engine.py -- ReasoningEngineV3Engine
+engine.py, ReasoningEngineV3Engine
 =====================================
 
-Additive extension of ReasoningEngineV25 that wires in the 12M model's
+Additive extension of ReasoningEngineV25 that wires in the 13.7M model's
 built-in transitive-closure enrichment.
 
 What it adds vs the core engine:
-  - _enrich_with_derive() driven by the 12M model's E4 expert
+  - _enrich_with_derive() driven by the 13.7M model's E4 expert
   - analyze() and analyze_blocks() call super(), then enrich the result
   - Two new keys written additively to every result dict:
       merged["derived_assumptions"]  -- list of {assuming, premise} dicts
@@ -44,7 +44,7 @@ logger = logging.getLogger(__name__)
 
 class ReasoningEngineV252(ReasoningEngineV25):
     """
-    V3 -- core engine + 12M built-in transitive-closure enrichment.
+    V3, core engine + 13.7M built-in transitive-closure enrichment.
 
     Subclasses ReasoningEngineV25 additively: all existing behavior is
     preserved; the only change is that every result dict gains two new keys:
@@ -295,7 +295,7 @@ class ReasoningEngineV252(ReasoningEngineV25):
         derived = merged.get("derived_assumptions", [])
         meta = merged.get("derive_meta", {})
         lines.append("")
-        lines.append("DERIVED ASSUMPTIONS (v3 12M closure):")
+        lines.append("DERIVED ASSUMPTIONS (v3 13.7M closure):")
         if derived:
             for pair in derived:
                 lines.append(f"  {pair.get('assuming')} => {pair.get('premise')}")
@@ -367,7 +367,7 @@ class ReasoningEngineV252(ReasoningEngineV25):
         edges: List[Tuple[str, str]],
     ) -> Tuple[List[Tuple[str, str]], dict]:
         """
-        Transitive-closure assumptions from the 12M model's dedicated E4 expert.
+        Transitive-closure assumptions from the 13.7M model's dedicated E4 expert.
 
         The closure is computed end-to-end in the network (Pass B / family-5 routing
         to E4) via ReasoningEngineV3.derive_assumptions(); no separate parametric
@@ -382,7 +382,7 @@ class ReasoningEngineV252(ReasoningEngineV25):
             "n_edges": len(unique_edges),
             "n_entities": len(entity_set),
             "strategy": "none" if not unique_edges else "e4_closure",
-            "source": "12m_v4_E4",
+            "source": "13_7m_v4_E4",
             "assumption_verdict": None,
         }
 
@@ -433,9 +433,9 @@ class ReasoningEngineV252(ReasoningEngineV25):
         source_edges: Optional[List[Tuple[str, str]]] = None,
     ) -> list:
         """
-        Feed 12M model assumptions into the normal V2 block pipeline.
+        Feed 13.7M model assumptions into the normal V2 block pipeline.
 
-        V3 still owns perception.  The 12M model derives transitive
+        V3 still owns perception.  The 13.7M model derives transitive
         assumptions from V3 dependency edges.  Those assumptions are appended as
         ordinary dependency blocks before _run_v2(), so root blockers, unlock
         order, critical path, and parallel-work heuristics are computed by the
@@ -468,11 +468,11 @@ class ReasoningEngineV252(ReasoningEngineV25):
                 "roles": {"blocked": src, "blocker": tgt},
                 "source_clause": (
                     f"{src} transitively depends on {tgt} "
-                    "(derived by 12M MoE E4 closure)"
+                    "(derived by 13.7M MoE E4 closure)"
                 ),
                 "confidence": 0.78,
                 "derived": True,
-                "derive_source": "12m_v4_E4",
+                "derive_source": "13_7m_v4_E4",
             })
 
         return enriched_blocks
@@ -493,7 +493,7 @@ class ReasoningEngineV252(ReasoningEngineV25):
           3. unlock_sequence chain      (lite mode; consecutive step pairs)
 
         Strategy:
-          spoon-fed 2-hop 12M model windows, guarded by exact traversal
+          spoon-fed 2-hop 13.7M model windows, guarded by exact traversal
 
         Never raises. Never removes or modifies existing keys.
         """
@@ -569,9 +569,9 @@ class ReasoningEngineV252(ReasoningEngineV25):
 
     @staticmethod
     def _probe_closure_engine() -> dict:
-        # Transitive closure is produced by the 12M model's dedicated E4
+        # Transitive closure is produced by the 13.7M model's dedicated E4
         # expert (ReasoningEngineV3.derive_assumptions).
-        return {"engine": "12m_v4_E4", "nn": True, "bfs": False}
+        return {"engine": "13_7m_v4_E4", "nn": True, "bfs": False}
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -581,7 +581,7 @@ def main():
     import json
 
     parser = argparse.ArgumentParser(
-        description="Pre-Reasoning v3.0.0 -- 12M neural engine"
+        description="Pre-Reasoning v3.0.0, 13.7M neural engine"
     )
     parser.add_argument("text", nargs="?", help="Problem text to analyze")
     parser.add_argument("--checkpoint", type=str, default=None)
