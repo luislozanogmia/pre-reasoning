@@ -1,76 +1,133 @@
-"""Public package API for Pre-Reasoning."""
-
+"""Public Pre-Reasoning V4 API."""
 from __future__ import annotations
 
-from typing import Optional
+from .engine import (
+    FOCUS_INTERVAL_MINUTES,
+    FOCUS_REMINDER,
+    FOCUS_SCHEDULER_PROMPT,
+    FormError,
+    FocusMode,
+    MIN_FORM_BLOCKS,
+    SHORT_FORM_ALARM,
+    V4ReasoningEngine,
+    form_spec,
+)
 
-from .engine_core import ReasoningEngineV25 as ReasoningEngineV25Legacy
-from .engine import ReasoningEngineV252
-from .inference import ReasoningEngineV3
+__version__ = "4.0.1"
 
-ReasoningEngine = ReasoningEngineV252
-ReasoningEngineV25 = ReasoningEngineV252
-
-__all__ = [
-    "ReasoningEngineV25",
-    "ReasoningEngineV25Legacy",
-    "ReasoningEngineV252",
-    "ReasoningEngineV3",
-    "ReasoningEngine",
-    "analyze",
-    "pulse",
-    "get_engine",
-]
+ReasoningEngine = V4ReasoningEngine
+ReasoningEngineV4 = V4ReasoningEngine
+_ENGINE_CACHE = {}
 
 
-_ENGINE_CACHE: dict = {}
-
-
-def get_engine(
-    *,
-    checkpoint_path: Optional[str] = None,
-    device: str = "auto",
-) -> ReasoningEngineV25:
-    """Return a reasoning engine (13.7M neural perception + graph analysis).
-
-    Engines are cached per (checkpoint_path, device): the 13.7M checkpoint
-    load (~250 ms) is paid once per process instead of on every analyze()
-    call. Set PRE_REASONING_NO_ENGINE_CACHE=1 to restore the old
-    build-per-call behavior.
-    """
-    import os
-    if os.environ.get("PRE_REASONING_NO_ENGINE_CACHE") == "1":
-        return ReasoningEngine(checkpoint_path=checkpoint_path, device=device)
+def get_engine(*, checkpoint_path: str | None = None, device: str = "auto"):
     key = (checkpoint_path, device)
-    engine = _ENGINE_CACHE.get(key)
-    if engine is None:
-        engine = ReasoningEngine(checkpoint_path=checkpoint_path, device=device)
-        _ENGINE_CACHE[key] = engine
-    return engine
+    if key not in _ENGINE_CACHE:
+        _ENGINE_CACHE[key] = V4ReasoningEngine(checkpoint_path, device)
+    return _ENGINE_CACHE[key]
 
 
-def analyze(
-    text: str,
+def get_form() -> dict:
+    """Return the structured-form contract without loading the checkpoint."""
+    return form_spec()
+
+
+def analyze_form(
+    form_text: str,
     *,
-    checkpoint_path: Optional[str] = None,
+    checkpoint_path: str | None = None,
     device: str = "auto",
 ) -> dict:
-    """Analyze problem text and return a structural trace result."""
     return get_engine(
-        checkpoint_path=checkpoint_path,
-        device=device,
-    ).analyze(text)
+        checkpoint_path=checkpoint_path, device=device
+    ).analyze_form(form_text)
 
 
 def pulse(
-    original_problem: str,
-    response: str,
+    form_text: str,
+    response: str | None = None,
     *,
-    checkpoint_path: Optional[str] = None,
+    checkpoint_path: str | None = None,
     device: str = "auto",
 ) -> dict:
-    """Check whether a draft response addresses detected root blockers."""
     return get_engine(
+        checkpoint_path=checkpoint_path, device=device
+    ).pulse(form_text, response)
+
+
+def start_focus_mode(
+    *,
+    interval_minutes: float = FOCUS_INTERVAL_MINUTES,
+    checkpoint_path: str | None = None,
+    device: str = "auto",
+) -> FocusMode:
+    """Start Focus Mode and expose its recurring in-chat scheduler request."""
+    return FocusMode(
+        interval_minutes=interval_minutes,
         checkpoint_path=checkpoint_path,
         device=device,
-    ).pulse(original_problem, response)
+    )
+
+
+def coverage_check(
+    form_text: str,
+    response: str,
+    *,
+    checkpoint_path: str | None = None,
+    device: str = "auto",
+) -> dict:
+    """Run the legacy lexical response-coverage check explicitly."""
+    return get_engine(
+        checkpoint_path=checkpoint_path, device=device
+    ).coverage_check(form_text, response)
+
+
+def coverage_check_result(
+    analysis: dict,
+    response: str,
+    *,
+    checkpoint_path: str | None = None,
+    device: str = "auto",
+) -> dict:
+    """Check lexical coverage against an existing analysis result."""
+    return get_engine(
+        checkpoint_path=checkpoint_path, device=device
+    ).coverage_check_result(analysis, response)
+
+
+def pulse_result(
+    analysis: dict,
+    response: str,
+    *,
+    checkpoint_path: str | None = None,
+    device: str = "auto",
+) -> dict:
+    """Compatibility alias for :func:`coverage_check_result`."""
+    return coverage_check_result(
+        analysis,
+        response,
+        checkpoint_path=checkpoint_path,
+        device=device,
+    )
+
+
+__all__ = [
+    "FOCUS_INTERVAL_MINUTES",
+    "FOCUS_REMINDER",
+    "FOCUS_SCHEDULER_PROMPT",
+    "FormError",
+    "FocusMode",
+    "MIN_FORM_BLOCKS",
+    "ReasoningEngine",
+    "ReasoningEngineV4",
+    "SHORT_FORM_ALARM",
+    "__version__",
+    "analyze_form",
+    "coverage_check",
+    "coverage_check_result",
+    "get_engine",
+    "get_form",
+    "pulse",
+    "pulse_result",
+    "start_focus_mode",
+]

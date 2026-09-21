@@ -1,8 +1,19 @@
-from pre_reasoning import analyze
+from pre_reasoning import analyze_form
 
+# One AI-authored form can contain all five reasoning families.
+form = """DEPENDENCIES
+Production Launch depends on Security Review.
+Security Review depends on Architecture Approval.
 
-result = analyze(
-    "CTO conflicts with senior dev. Release requires 80 percent test coverage.",
-)
+CONFLICTS
+Fast Rollout conflicts with Safety Review.
 
-print(result["trace"])
+REQUIREMENTS
+Test Coverage must be at least 95.
+
+CONDITIONALS
+If Security Review passes, then Production Launch can proceed, otherwise Remediation must proceed.
+"""
+
+analysis = analyze_form(form)
+print(analysis["trace"])

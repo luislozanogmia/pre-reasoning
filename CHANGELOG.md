@@ -1,5 +1,31 @@
 # Changelog
 
+## v4.0.1
+
+- Adds scheduler-backed Focus Mode with a ten-minute default interval. It exposes an explicit model-facing request to create or update one recurring task in the current chat, including the durable task prompt and duplicate-prevention instruction.
+- Keeps `focus.check()` as a local fallback for hosts without scheduling support; the package itself does not start a sleeping process, background thread, or OS crontab entry.
+- Redefines `pulse(form_text)` as a fresh checkpoint-backed reasoning pass over the AI's current structured view of the problem.
+- Keeps a failed short-form pulse due and returns the existing `REPROMPT_REQUIRED` alarm with the exact five-block form template.
+- Renames the former word-presence behavior to `coverage_check()` and `coverage_check_result()`, and marks its result explicitly as lexical and not semantically verified.
+- Preserves the former `pulse(form_text, response)` and `pulse_result(analysis, response)` signatures as compatibility aliases.
+
+- Fixes the V4 package loader so the 1M-parameter checkpoint is reconstructed with its exact architecture and loaded with strict tensor validation.
+- Routes the public `analyze()` and `pulse()` API through the loaded neural component instead of the accidental parser-only path.
+- Removes copied training-framework, optimizer, dataset, and checkpoint-management modules from the distribution; only the inference architecture remains.
+- Defines the product boundary explicitly: the calling AI interprets natural language and writes the structured form; the checkpoint executes learned structural operations; the adapter validates, binds, windows, restores names, and renders the trace for the AI's next forward pass.
+- Adds a model-decoded adapter: it binds submitted entities to learned placeholders, the checkpoint generates each required operation, and the adapter restores the original names from the generated result.
+- Adds neural ablations proving that reversed model output reverses the public relation and disabled generation cannot fall back to parser-only output.
+- Revalidated the public execution path at 3,000/3,000 on the frozen compatibility board.
+- Replaces raw-prompt examples and hooks with the form-first integration and removes platform-specific sidecars and legacy benchmark artifacts from the core repository.
+- Adds a five-block minimum guard: shorter valid forms return a `REPROMPT_REQUIRED` alarm with the submitted form and an attached retry template before neural analysis runs.
+
+## v4.0.0
+
+- Public release of the V4 pre-reasoning engine, replacing the previous V3 release while preserving its structural contract.
+- Ships a weights-only 1M checkpoint under a neutral filename; model lineage and training state are not part of the public version.
+- Adds capability-aware grouped loss documentation and compact cycle-safe structural traces.
+- Known packaging defect: the public API did not execute the bundled 1M checkpoint. Superseded by v4.0.1.
+
 ## v3.1.0
 
 CPU inference is 4-6x faster. No API changes, no new dependencies, identical
@@ -17,7 +43,7 @@ so other models running in the same client process are unaffected.
   saved and restored, never changed globally.
 - Engine singleton: `get_engine()`/`analyze()` reuse one engine per
   (checkpoint, device) instead of reloading the checkpoint each call.
-- Persistent E4 closure-window cache: canonical 2-hop windows are
+- Persistent E4 closure-window cache: structured 2-hop windows are
   deterministic (greedy decode, fixed weights), so results are memoized on
   the model instance across calls.
 - Escape hatches (env vars, all default-off): `PRE_REASONING_DISABLE_KV=1`
@@ -28,10 +54,10 @@ so other models running in the same client process are unaffected.
 
 ## v3.0.0
 
-- Upgraded to 13.7M trainable parameter MoE model (v4, 5 expert groups) as the standalone engine.
+- Upgraded the V3 engine to the 13.7M trainable-parameter MoE model with five expert groups.
 - Transitive closure is now computed by the built-in E4 expert. The external derive_expert package is no longer needed.
 - Renamed internal modules: engine.py (was pre_reasoning_v2_5_2.py), engine_core.py (was pre_reasoning_v2_5.py).
-- Checkpoint upgraded from 3M (11MB) to 13.7M trainable parameters (85MB file, 22.1M tensor values including fixed masks).
+- Checkpoint upgraded from the earlier 3M model to the 13.7M model distributed as `pre-reasoning-12m-v3.safetensors`.
 - Removed derive_expert sub-package from the distribution.
 - Fixed broken imports caused by the module rename.
 

@@ -1,74 +1,96 @@
 # Install Pre-Reasoning
 
-This project has two integration levels:
+## Install from this bundle
 
-1. Install the Python package so a person or model can run `pre-reasoning`, `analyze()`, and `pulse()`.
-2. Optionally install Claude Code hooks so pre-reasoning runs before and after model responses.
-
-The hooks are optional. The Python package is the required part.
-
-## 1. Install The Package
-
-From PyPI:
+From the GitHub checkout (run this inside the `1M/` directory):
 
 ```bash
-pip install pre-reasoning
+python -m pip install .
 ```
 
-From a local checkout:
+For a local editable install while developing:
 
 ```bash
 pip install -e .
 ```
 
-Verify it:
+The 1M release is not the currently published PyPI build. Do not use
+`pip install pre-reasoning` when you need this exact checkpoint.
+
+Verify the checkpoint and runtime:
 
 ```bash
 pre-reasoning --info
 ```
 
-Expected: the command prints engine info and reports the bundled neural engine availability.
-
-## 2. Run It Manually
-
-CLI:
+Print the form contract without loading the checkpoint:
 
 ```bash
-pre-reasoning "Frontend depends on API. API depends on Auth."
+pre-reasoning --form
 ```
 
-Python:
+## Core integration
+
+The outer AI must interpret the original language and write the structured form. Do not pass arbitrary user prose directly to the engine.
 
 ```python
-from pre_reasoning import analyze, pulse
+from pre_reasoning import (
+    analyze_form,
+    coverage_check_result,
+    get_form,
+    start_focus_mode,
+)
 
-problem = "Frontend depends on API. API depends on Auth."
-result = analyze(problem)
-print(result["trace"])
+contract = get_form()
 
-draft = "Resolve Auth first, then verify API, then unblock Frontend."
-check = pulse(problem, draft)
-print(check)
+form = """DEPENDENCIES
+Frontend depends on API.
+API depends on Auth.
+Auth depends on Key Management.
+Key Management depends on HSM Provisioning.
+HSM Provisioning depends on Procurement.
+"""
+
+analysis = analyze_form(form)
+print(analysis["trace"])
+
+# Optional lexical presence check after the AI drafts its second-pass answer.
+# This does not verify semantic correctness.
+draft = "Resolve Procurement, HSM Provisioning, Key Management, Auth, and API before Frontend."
+print(coverage_check_result(analysis, draft))
+
+# Scheduler-backed Focus Mode for longer work sessions.
+focus = start_focus_mode()
+print(focus.scheduler_request())
+
+# On each scheduled run, build a fresh form from the current work state.
+print(focus.pulse(form, force=True)["trace"])
 ```
 
-Use `analyze()` before answering. The result includes `blocks`, `derived_blocks`, and `derive_meta` in addition to the trace. Use `pulse()` before stopping.
+The form must contain at least five valid blocks. If it is shorter, the result has
+`status: REPROMPT_REQUIRED`, an explicit alarm, and an `attached_form` template
+for the AI to use on the next attempt. The important step happens outside this
+package: place the returned trace beside the original context and let the AI
+continue in a new forward pass.
 
-## 3. Optional Skill Install
+An automation-capable calling model should immediately consume
+`focus.scheduler_request()` and create or update one recurring ten-minute task
+in the current chat. The package does not create a sleeper, background process,
+or OS crontab entry. `focus.check()` is only the fallback when the host has no
+scheduling capability. Every successful pulse resets the local fallback timer.
 
-If the user has Claude skills enabled, copy the skill descriptor:
+## Optional agent skill
 
 ```bash
 mkdir -p ~/.claude/skills/pre-reasoning
 cp skill/SKILL.md ~/.claude/skills/pre-reasoning/SKILL.md
 ```
 
-This tells the model how to call the engine, but it does not force the model to use it.
+The skill teaches the AI to construct the form, call `analyze_form()`, and use the returned trace before answering.
 
-## 4. Optional Claude Code Hooks
+## Optional Claude Code hooks
 
-The hooks enforce pre-reasoning outside the model. They are for Claude Code.
-
-Copy the hook files somewhere stable:
+The hooks inject the form-first obligation before substantive turns and verify that the agent used pre-reasoning before stopping. They do not parse the user's prose or compute a trace themselves.
 
 ```bash
 mkdir -p ~/.claude/hooks/pre-reasoning
@@ -77,7 +99,7 @@ cp hooks/stop_enforcer.py ~/.claude/hooks/pre-reasoning/stop_enforcer.py
 chmod +x ~/.claude/hooks/pre-reasoning/*.py
 ```
 
-Add this to `~/.claude/settings.json`, merging with any existing settings:
+Merge into `~/.claude/settings.json`:
 
 ```json
 {
@@ -101,7 +123,7 @@ Add this to `~/.claude/settings.json`, merging with any existing settings:
           {
             "type": "command",
             "command": "python3 ~/.claude/hooks/pre-reasoning/stop_enforcer.py",
-            "timeout": 15
+            "timeout": 10
           }
         ]
       }
@@ -110,48 +132,12 @@ Add this to `~/.claude/settings.json`, merging with any existing settings:
 }
 ```
 
-If `~` is not expanded by the host, replace it with the absolute home path.
-
-## 5. How The Hooks Work
-
-`hooks/user_prompt_submit.py` runs before the model answers.
-
-- It reads the user prompt.
-- If the prompt is substantive, it calls `pre_reasoning.analyze(prompt)`.
-- It injects the structural trace as extra context, including derived assumptions when transitive dependency pressure is detected.
-- If the trace is weak, it tells the model to rewrite the problem with stronger structural signals and run `analyze()` again.
-
-`hooks/stop_enforcer.py` runs when the model tries to finish.
-
-- If the first trace was weak, it checks whether the model reran `analyze()`.
-- It calls `pre_reasoning.pulse(problem, response)`.
-- If root blockers were missed, it blocks the stop and tells the model what gaps to address.
-
-So the flow is:
+The resulting turn is:
 
 ```text
-User prompt
-  -> UserPromptSubmit hook
-  -> analyze(prompt)
-  -> trace injected into model context
-  -> model writes answer
-  -> Stop hook
-  -> pulse(original_problem, model_response)
-  -> allow stop or require revision
-```
-
-## 6. What To Tell Another AI
-
-If handing this repo to another model, give it this instruction:
-
-```text
-Install the package with `pip install pre-reasoning` or `pip install -e .`.
-Before answering complex prompts, run `from pre_reasoning import analyze` and use
-`analyze(problem)["trace"]` to ground the answer. Before finishing, run
-`pulse(problem, draft_response)` and revise if it returns CONTINUE.
-
-If this is Claude Code, optionally install the two hooks in `hooks/`:
-`user_prompt_submit.py` runs before the answer and injects the trace;
-`stop_enforcer.py` runs after the draft and blocks completion if root blockers
-were missed.
+User context
+  -> hook reminds AI to build the form
+  -> AI calls analyze_form(form_text)
+  -> tool result creates a new forward pass
+  -> AI answers using original context + external trace
 ```

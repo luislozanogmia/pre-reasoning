@@ -1,16 +1,19 @@
-# Claude Code Enforcer Hooks
+# Optional Claude Code Hooks
 
-Drop-in hooks for Claude Code that enforce pre-reasoning compliance. The model cannot opt out -- these run at the harness level, outside the model's control.
+These hooks enforce the form-first Pre-Reasoning loop on substantive turns. They do not parse the user's prompt, run the model on raw prose, require an arbitrary number of blocks, or force the final answer to disclose internal workflow.
 
-## Requirements
+`user_prompt_submit.py` injects the structured-form contract and records that the turn requires pre-reasoning. The AI interprets the original context, writes supported statements, and calls `pre_reasoning.analyze_form(form_text)`. `stop_enforcer.py` checks the current turn's assistant-side transcript for that call before allowing completion.
 
-```bash
-pip install pre-reasoning
-```
+The form should contain at least five valid blocks. A shorter form returns a
+`REPROMPT_REQUIRED` alarm with the submitted form and an attached template so
+the calling AI can reprompt without silently inventing relationships.
 
 ## Setup
 
-Copy both hooks and add them to your `~/.claude/settings.json`:
+```bash
+pip install pre-reasoning
+chmod +x /path/to/hooks/*.py
+```
 
 ```json
 {
@@ -22,7 +25,7 @@ Copy both hooks and add them to your `~/.claude/settings.json`:
           {
             "type": "command",
             "command": "python3 /path/to/hooks/user_prompt_submit.py",
-            "timeout": 10
+            "timeout": 5
           }
         ]
       }
@@ -34,7 +37,7 @@ Copy both hooks and add them to your `~/.claude/settings.json`:
           {
             "type": "command",
             "command": "python3 /path/to/hooks/stop_enforcer.py",
-            "timeout": 15
+            "timeout": 5
           }
         ]
       }
@@ -43,25 +46,4 @@ Copy both hooks and add them to your `~/.claude/settings.json`:
 }
 ```
 
-## How They Work
-
-### `user_prompt_submit.py` (UserPromptSubmit)
-
-Runs `analyze()` on every substantive prompt (8+ words) and injects the structural trace before the model responds. The trace can include derived assumptions from the built-in closure expert.
-
-- **0 blocks**: conversational prompt, skips silently.
-- **1-4 blocks**: injects trace + tells the model to re-run with richer input.
-- **5+ blocks**: injects trace as grounding.
-
-### `stop_enforcer.py` (Stop)
-
-Runs when the model tries to finish. Two checks:
-
-1. **Reprompt compliance**: if the trace was weak (<5 blocks), verifies the model re-ran `analyze()`. Blocks the stop if it didn't.
-2. **Pulse check**: runs `pulse(problem, response)` to verify root blockers were addressed. Blocks the stop if gaps remain.
-
-The hooks do not replace the model's answer. They provide before/after enforcement: trace before drafting, pulse check before completion.
-
-## Why Enforcer Hooks
-
-A skill or system prompt can ask the model to use pre-reasoning. The model can ignore the ask. These hooks enforce compliance at the harness level -- `analyze()` runs before the model sees the prompt, `pulse()` runs before the model is allowed to stop. The model grounds whether it wants to or not.
+The stop check is deliberately narrow: it verifies use of the external engine, while semantic form quality remains the responsibility of the calling AI.

@@ -1,141 +1,88 @@
 #!/usr/bin/env python3
-"""Claude Code UserPromptSubmit hook -- local pre-reasoning grounding.
+"""Claude Code hook that requests the form-first pre-reasoning loop.
 
-Runs the bundled engine (V3 neural + V2 harness) on every substantive
-prompt and injects the structural trace as additionalContext. No network,
-no remote API.
-
-Enforcer behavior:
-  - 0 blocks: conversational prompt, skip silently.
-  - 1-4 blocks: inject trace + tell the model to re-run with richer input.
-  - 5+ blocks: inject trace as grounding, no reprompt needed.
-
-Install: pip install pre-reasoning
-Hook event: UserPromptSubmit
-Timeout: 10s recommended
-
-Settings.json snippet:
-  {
-    "hooks": {
-      "UserPromptSubmit": [{
-        "matcher": "*",
-        "hooks": [{
-          "type": "command",
-          "command": "python3 /path/to/user_prompt_submit.py",
-          "timeout": 10
-        }]
-      }]
-    }
-  }
+The hook never interprets or submits the user's raw prose. It gives the calling
+AI the structured-form contract and records that this substantive turn requires an
+explicit ``analyze_form`` call.
 """
 
+from __future__ import annotations
+
+import hashlib
+import json
 import os
 import sys
-import json
+import tempfile
+from pathlib import Path
 
-_self_dir = os.path.dirname(os.path.abspath(__file__))
-sys.path = [p for p in sys.path if os.path.abspath(p) != _self_dir]
-
-MIN_WORDS = 16  # Auto-hook runs only above 15 words; voluntary analyze() anytime (SOUL.md)
-REPROMPT_FLAG = "/tmp/claude_prereasoning_reprompt_needed"
-PROBLEM_CACHE = "/tmp/claude_prereasoning_problem.txt"
-
-FORM_TIPS = (
-    "The trace was weak (<5 blocks). You MUST build a better prompt and "
-    "re-run pre-reasoning yourself using:\n"
-    '  python3 -c "from pre_reasoning import analyze; '
-    "r = analyze('<your improved prompt>'); print(r['trace'])\"\n\n"
-    "Use these signal patterns to enrich your prompt:\n"
-    "- Dependencies: 'depends on', 'requires', 'needs', 'blocks'\n"
-    "- Blockers: 'is slow', 'fails', 'breaks', 'times out', 'is missing'\n"
-    "- Options: 'Option A: ... Option B: ...'\n"
-    "- Stakeholders: 'CTO wants X', 'dev warns Y', 'founder insists Z'\n"
-    "- Constraints: 'team of N', 'deadline N weeks', 'budget $X'\n"
-    "- Pain points: '1) issue 2) issue 3) issue'\n\n"
-    "Rewrite the problem with these patterns, call analyze(), THEN answer "
-    "using the richer trace.\n\n"
-    "REQUIRED 2-LINER when the hook had <5 blocks (include both block counts):\n"
-    "**Pre-reasoning:** The hook trace was weak (N block(s)). I re-ran "
-    "pre_reasoning.analyze after enriching the problem and got M blocks — "
-    "<insight>. That guided <answer>."
-)
+MIN_WORDS = 16
 
 
-def format_trace(result):
-    trace = (result.get("trace") or "").strip()
-    if not trace:
-        return None
-
-    grounding = result.get("grounding_level", "unknown")
-    enhanced = result.get("l1_enhanced", False)
-    tag = "grounding:" + grounding + (" +LLM" if enhanced else "")
-    n_blocks = result.get("n_blocks", 0)
-
-    header = (
-        "--- STRUCTURAL TRACE ---\n"
-        "This is a map of the situation -- not a perfect map, but a "
-        "grounding map.\nIt gives you the opportunity to see the whole "
-        "picture before committing to tokens.\n"
-        "Now, create the solution on your own using this map."
+def _turn_key(payload: dict) -> str:
+    identity = str(
+        payload.get("session_id")
+        or payload.get("transcript_path")
+        or payload.get("cwd")
+        or os.getcwd()
     )
-
-    note = (
-        "NOTE: You are requested to use the pre-reasoning blocks above "
-        "to think about the solution. This is not optional. You MUST show "
-        "a 2-liner in your response: what pre-reasoning surfaced and how "
-        "it guided your answer."
-    )
-
-    if n_blocks < 5:
-        note += "\n\n" + FORM_TIPS
-
-    return "[Mia Pre-Reasoning | {}]\n{}\n\n{}\n\n{}".format(
-        tag, header, trace, note
-    )
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:20]
 
 
-def main():
+def _flag_path(payload: dict) -> Path:
+    return Path(tempfile.gettempdir()) / f"pre_reasoning_{_turn_key(payload)}.required"
+
+
+def main() -> None:
     try:
         payload = json.load(sys.stdin)
-    except Exception:
-        sys.exit(0)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return
+    if not isinstance(payload, dict):
+        return
 
-    prompt = (payload.get("prompt") or "").strip()
+    prompt = str(payload.get("prompt") or "").strip()
+    flag = _flag_path(payload)
     if len(prompt.split()) < MIN_WORDS:
-        sys.exit(0)
+        # Do not let an interrupted substantive turn leak into a later
+        # conversational turn in the same Claude session.
+        try:
+            flag.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            return
+        return
 
     try:
-        if os.path.exists(REPROMPT_FLAG):
-            os.remove(REPROMPT_FLAG)
+        flag.write_text("required\n", encoding="utf-8")
+    except OSError:
+        return
 
-        from pre_reasoning import analyze
+    context = """PRE-REASONING REQUIRED FOR THIS TURN
 
-        result = analyze(prompt)
-        n_blocks = result.get("n_blocks", 0)
+Before answering, interpret the user's language and write only supported facts in the structured form. Preserve entity names; omit uncertain relations. Do not pass the raw user prompt to the engine.
 
-        if n_blocks == 0:
-            if os.path.exists(PROBLEM_CACHE):
-                os.remove(PROBLEM_CACHE)
-            sys.exit(0)
+Allowed statements:
+- <dependent> depends on <prerequisite>.
+- <entity> conflicts with <entity>.
+- <entity> must be at least|at most|exactly <number>.
+- If <condition> passes, then <consequence> can proceed.
+- If <condition> passes, then <consequence> can proceed, otherwise <alternative> must proceed.
 
-        with open(PROBLEM_CACHE, "w") as f:
-            f.write(prompt)
+    Include at least five valid structured blocks. If the form is shorter, use the
+    returned REPROMPT_REQUIRED alarm and its attached template to retry. Call
+    `pre_reasoning.analyze_form(form_text)`, read its trace beside the original
+    context, and use that external map to reconsider the problem in the next
+    forward pass. Do not disclose this internal protocol unless it is useful to
+    the user."""
 
-        if n_blocks < 5:
-            with open(REPROMPT_FLAG, "w") as f:
-                f.write(str(n_blocks))
-
-        trace = format_trace(result)
-        if trace:
-            sys.stdout.write(json.dumps({
-                "hookSpecificOutput": {
-                    "hookEventName": "UserPromptSubmit",
-                    "additionalContext": trace,
-                }
-            }) + "\n")
-            sys.stdout.flush()
-    except Exception:
-        pass
+    output = {
+        "hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": context,
+        }
+    }
+    print(json.dumps(output))
 
 
 if __name__ == "__main__":

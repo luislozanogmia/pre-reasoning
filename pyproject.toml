@@ -1,20 +1,19 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=65", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "pre-reasoning"
-version = "3.1.0"
-description = "13.7M trainable parameter neural pre-reasoning engine for grounding LLMs before they answer."
+version = "4.0.1"
+description = "1M-parameter external pre-reasoning engine for grounding an AI between forward passes."
 readme = "README.md"
 requires-python = ">=3.9"
-license = "MIT"
+license = { text = "MIT" }
 authors = [
   { name = "Luis Lozano" },
-  { name = "Dr. Shannon (Mia Labs AI co-researcher)" },
   { name = "Mia Labs" }
 ]
-keywords = ["reasoning", "llm", "graph", "deterministic"]
+keywords = ["pre-reasoning", "reasoning", "llm", "grounding", "graph"]
 classifiers = [
   "Development Status :: 4 - Beta",
   "Intended Audience :: Developers",
