@@ -1,4 +1,12 @@
 include pre_reasoning/checkpoints/*.safetensors
+include CHANGELOG.md
+include EVALS.md
+include INSTALL.md
+include WHY_TRACES_WORK.md
+include loss_function_optimization.md
+recursive-include examples *.py
+recursive-include hooks *.md *.py
+recursive-include skill *.md
 prune __pycache__
 global-exclude *.py[cod]
 global-exclude .DS_Store

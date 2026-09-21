@@ -1,1 +1,1 @@
-"""Bundled weights for optional neural perception."""
+"""Bundled weights for the Pre-Reasoning V4 learned operator engine."""

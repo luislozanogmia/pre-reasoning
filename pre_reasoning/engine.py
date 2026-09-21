@@ -1,626 +1,1105 @@
-#!/usr/bin/env python3
+"""Pre-Reasoning V4: external structural analysis for a second forward pass.
+
+The calling AI interprets the user's language and writes the structured form.
+This module validates that form, binds its entities to the checkpoint's learned
+operator vocabulary, runs neural operations, restores the original entities,
+and returns a structural trace for the AI's next forward pass.
 """
-engine.py, ReasoningEngineV3Engine
-=====================================
-
-Additive extension of ReasoningEngineV25 that wires in the 13.7M model's
-built-in transitive-closure enrichment.
-
-What it adds vs the core engine:
-  - _enrich_with_derive() driven by the 13.7M model's E4 expert
-  - analyze() and analyze_blocks() call super(), then enrich the result
-  - Two new keys written additively to every result dict:
-      merged["derived_assumptions"]  -- list of {assuming, premise} dicts
-      merged["derive_meta"]          -- strategy, n_edges, n_entities, edge_source
-
-What is NEVER changed:
-  - No existing key in the result dict is modified or removed
-
-Author: Dr. Shannon, Mia Labs
-Date: 2026-06-14
-"""
-
 from __future__ import annotations
 
-import logging
 import re
-import sys
 import time
-from collections import deque
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from collections import Counter, defaultdict
+from collections.abc import Callable, Iterable
 
-# ── Base import ───────────────────────────────────────────────────────────────
-try:
-    from .engine_core import ReasoningEngineV25  # noqa: E402
-except ImportError:  # Allows direct script execution from this directory.
-    _PACKAGE_DIR = Path(__file__).resolve().parent
-    if str(_PACKAGE_DIR) not in sys.path:
-        sys.path.insert(0, str(_PACKAGE_DIR))
-    from engine_core import ReasoningEngineV25  # type: ignore # noqa: E402
+from .inference import MODEL_PARAMS, generate_completion, load_model
 
-logger = logging.getLogger(__name__)
+_ENTITY_A = "amber project one"
+_ENTITY_B = "blue relay two"
+_ENTITY_C = "coral gate three"
+
+FORM_TEMPLATE = """DEPENDENCIES
+<dependent> depends on <prerequisite>.
+
+CONFLICTS
+<entity> conflicts with <entity>.
+
+REQUIREMENTS
+<entity> must be at least <number>.
+<entity> must be at most <number>.
+<entity> must be exactly <number>.
+
+CONDITIONALS
+If <condition> passes, then <consequence> can proceed.
+If <condition> passes, then <consequence> can proceed, otherwise <alternative> must proceed.
+"""
+
+_SECTION_NAMES = {
+    "dependencies",
+    "conflicts",
+    "requirements",
+    "conditionals",
+}
+
+MIN_FORM_BLOCKS = 5
+SHORT_FORM_ALARM = "PRE-REASONING ALARM: INSUFFICIENT STRUCTURED BLOCKS"
+FOCUS_INTERVAL_MINUTES = 10
+FOCUS_REMINDER = (
+    "Pause active work and run a fresh pre-reasoning pass. Re-read the original "
+    "problem, identify what changed, and express the currently supported "
+    "dependencies, conflicts, numeric requirements, and conditional branches "
+    "in at least five valid structured blocks. Review the returned root blockers "
+    "and derived assumptions before choosing the next move."
+)
 
 
-class ReasoningEngineV252(ReasoningEngineV25):
-    """
-    V3, core engine + 13.7M built-in transitive-closure enrichment.
+def _focus_scheduler_request(interval_minutes: float) -> dict:
+    cadence = f"{interval_minutes:g}"
+    task_prompt = (
+        "Run a Focus Mode pre-reasoning pulse for the substantive work currently "
+        "active in this chat. Re-read the original goal and latest work state. "
+        "Translate only supported facts into at least five valid Pre-Reasoning "
+        "blocks covering the applicable dependencies, conflicts, numeric "
+        "requirements, and conditional branches. Run a fresh pulse through the "
+        "local 1M bundle, read its trace, and reconsider the next move before "
+        "continuing. Keep the pulse internal unless it changes the plan, reveals "
+        "a blocker or conflict, completes the work, or requires user input. If no "
+        "substantive work is active, stay quiet."
+    )
+    return {
+        "action": "create_or_update_recurring_task",
+        "destination": "current_chat",
+        "schedule": f"every {cadence} minutes",
+        "interval_minutes": interval_minutes,
+        "instruction": (
+            "Use the host's scheduling or automation capability now to create or "
+            f"update one recurring task in this current chat every {cadence} "
+            "minutes. Reuse an existing matching Focus Mode task instead of "
+            "creating a duplicate. Pause or remove it when the work ends."
+        ),
+        "task_prompt": task_prompt,
+    }
 
-    Subclasses ReasoningEngineV25 additively: all existing behavior is
-    preserved; the only change is that every result dict gains two new keys:
-      derived_assumptions : list of {assuming: str, premise: str}
-      derive_meta         : {n_edges, n_entities, strategy, edge_source}
 
-    Full analyze() is available and works identically to the core engine with the
-    extra enrichment on top. Requires the bundled neural perception
-    checkpoint at initialization and at runtime. Explicit harness parsing
-    is used only as an additive signal alongside neural perception, never as
-    a silent replacement for it.
-    """
+FOCUS_SCHEDULER_PROMPT = _focus_scheduler_request(
+    float(FOCUS_INTERVAL_MINUTES)
+)["instruction"]
 
-    VERSION = "3.1.0"
 
-    def __init__(self, checkpoint_path=None, device="auto"):
-        super().__init__(checkpoint_path=checkpoint_path, device=device)
+class FormError(ValueError):
+    """Hard failure carrying the submitted form so the AI can correct it."""
 
-    # ── Overrides ─────────────────────────────────────────────────────────────
+    def __init__(self, message: str, *, form_text: str | None = None):
+        super().__init__(message)
+        self.form_text = form_text
 
-    def analyze(self, text: str) -> dict:
-        t0 = time.perf_counter()
+    @property
+    def form(self) -> str | None:
+        """The exact submitted form, available for correction and retry."""
+        return self.form_text
 
-        v3_result = self._v3.analyze(text, mode="ls")
-        v2_blocks = self._v3_to_v2_blocks(v3_result)
-        harness_blocks = self._harness_blocks_from_text(text)
-        v2_blocks = self._merge_blocks_preserving_derive(
-            v2_blocks + harness_blocks
+
+class NeuralContractError(RuntimeError):
+    """Raised when the checkpoint violates a required learned operator contract."""
+
+
+def _clean(value: str) -> str:
+    """Normalize whitespace and punctuation without destroying entity spelling."""
+    return " ".join(value.strip(" \t\r\n.,:;").split())
+
+
+def _form_statements(text: str) -> Iterable[str]:
+    body = re.sub(
+        r"return\s+the\s+complete\s+reasoning\s+structure\s*\.?",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    for fragment in re.split(r";|(?<!\d)\.|\.(?!\d)|[\n]+", body):
+        statement = re.sub(r"^\s*(?:[-*]|\d+[.)])\s*", "", fragment).strip()
+        if not statement:
+            continue
+        label = statement.rstrip(":").strip().lower()
+        if label in _SECTION_NAMES or label == "none":
+            continue
+        yield statement
+
+
+def _parse_form(text: str):
+    """Parse the explicit AI-authored form; never infer meaning from raw prose."""
+    dependencies: set[tuple[str, str]] = set()
+    conflicts: set[tuple[str, str]] = set()
+    requirements: list[list[str]] = []
+    conditionals: list[list[str]] = []
+    rejected: list[str] = []
+
+    for statement in _form_statements(text):
+        conditional = re.fullmatch(
+            r"if\s+(.+?)\s+passes,\s*then\s+(.+?)\s+can proceed"
+            r"(?:,\s*otherwise\s+(.+?)\s+must proceed)?",
+            statement,
+            re.IGNORECASE,
         )
-        direct_edges = self._dependency_edges_from_blocks(v2_blocks)
-        v2_blocks = self._append_derived_dependency_blocks(
-            v2_blocks,
-            v3_result,
-            source_edges=direct_edges,
-        )
-        v2_blocks = self._merge_blocks_preserving_derive(v2_blocks)
-
-        v2_result = self._run_v2(v2_blocks)
-
-        merged = self._enrich_with_neural(v2_result, v3_result)
-
-        inference_ms = (time.perf_counter() - t0) * 1000
-        merged["inference_ms"] = round(inference_ms, 1)
-        merged["version"] = self.VERSION
-        merged["mode"] = self.mode
-        merged["neural_enriched"] = True
-
-        v3_edges = self._dependency_edges_from_v3(v3_result)
-        use_block_edges = len(set(direct_edges)) > len(set(v3_edges))
-        if use_block_edges:
-            merged["dependencies"] = [
-                {"src_name": src, "tgt_name": tgt}
-                for src, tgt in direct_edges
-            ]
-        merged = self._enrich_with_derive(
-            merged,
-            v3_result=None if use_block_edges else v3_result,
-        )
-        if use_block_edges:
-            merged.pop("dependencies", None)
-        self._attach_block_output(merged, v2_blocks)
-        self._attach_v3_root_blockers(merged, v3_result)
-        self._append_v252_trace_sections(merged)
-        self._last_result = merged
-        return merged
-
-    def analyze_blocks(self, blocks: list) -> dict:
-        t0 = time.perf_counter()
-        input_dependency_edges = self._dependency_edges_from_blocks(blocks)
-
-        v3_result = self._v3.analyze_blocks(blocks, mode="ls")
-
-        v2_blocks = list(blocks)
-        v2_blocks = self._append_derived_dependency_blocks(
-            v2_blocks,
-            v3_result,
-            source_edges=input_dependency_edges,
-        )
-
-        v2_result = self._run_v2(v2_blocks)
-
-        merged = self._enrich_with_neural(v2_result, v3_result)
-
-        inference_ms = (time.perf_counter() - t0) * 1000
-        merged["inference_ms"] = round(inference_ms, 1)
-        merged["version"] = self.VERSION
-        merged["mode"] = self.mode
-        merged["neural_enriched"] = True
-
-        v3_edges = self._dependency_edges_from_v3(v3_result)
-        # For structured blocks the caller's declared dependency edges are ground
-        # truth -- always prefer them over re-perceived v3 edges, which can drift
-        # out-of-distribution on large prompts and invent spurious links that then
-        # produce false transitive closures. Fall back to v3 only when the blocks
-        # carried no explicit dependency entities.
-        use_input_edges = bool(input_dependency_edges)
-        if use_input_edges:
-            merged["dependencies"] = [
-                {"src_name": src, "tgt_name": tgt}
-                for src, tgt in input_dependency_edges
-            ]
-
-        merged = self._enrich_with_derive(
-            merged,
-            v3_result=None if use_input_edges else v3_result,
-        )
-        if use_input_edges:
-            merged.pop("dependencies", None)
-        self._attach_block_output(merged, v2_blocks)
-        self._attach_v3_root_blockers(merged, v3_result)
-        self._append_v252_trace_sections(merged)
-        self._last_result = merged
-        return merged
-
-    def _harness_blocks_from_text(self, text: str) -> list:
-        try:
-            from .inference import _extract_entities_and_relations
-        except ImportError:  # Direct script execution from package directory.
-            from inference import _extract_entities_and_relations  # type: ignore
-
-        entity_order, ent_map, relations = _extract_entities_and_relations(text)
-        reverse_map = {
-            ent_map[name.lower()]: name
-            for name in entity_order
-            if name.lower() in ent_map
-        }
-        sentence_lookup = self._sentence_lookup(text)
-
-        blocks = []
-        for src_ent, rel, tgt_ent in relations:
-            src = reverse_map.get(src_ent, src_ent)
-            tgt = reverse_map.get(tgt_ent, tgt_ent)
-            source_clause = self._relation_source_clause(src, tgt, sentence_lookup)
-            if rel == "DEPENDS_ON":
-                blocks.append({
-                    "family": "dependency",
-                    "entities": [src, tgt],
-                    "roles": {"blocked": src, "blocker": tgt},
-                    "source_clause": source_clause or f"{src} depends on {tgt}",
-                    "confidence": 0.72,
-                })
-            elif rel in ("CONTRADICTS", "CONFLICTS"):
-                blocks.append({
-                    "family": "conflict",
-                    "entities": [src, tgt],
-                    "roles": {"initiator": src, "opposing": tgt},
-                    "source_clause": source_clause or f"{src} conflicts with {tgt}",
-                    "confidence": 0.70,
-                })
-
-        return self._merge_blocks_preserving_derive(blocks)
-
-    @staticmethod
-    def _sentence_lookup(text: str) -> List[str]:
-        return [
-            sentence.strip()
-            for sentence in re.split(r"[.;!?\n]+", text)
-            if sentence.strip()
-        ]
-
-    @staticmethod
-    def _relation_source_clause(src: str, tgt: str, sentences: List[str]) -> str:
-        src_l = src.lower()
-        tgt_l = tgt.lower()
-        for sentence in sentences:
-            lowered = sentence.lower()
-            if src_l in lowered and tgt_l in lowered:
-                return sentence
-        return ""
-
-    @staticmethod
-    def _block_key(block: dict) -> Tuple:
-        family = block.get("family", "")
-        roles = block.get("roles", {})
-        if family in ("dependency", "prereq"):
-            src = roles.get("blocked", roles.get("gated", ""))
-            tgt = roles.get("blocker", roles.get("gate", ""))
-            if not src or not tgt:
-                entities = block.get("entities", [])
-                if len(entities) >= 2:
-                    src, tgt = entities[0], entities[1]
-            return (family, str(src).lower(), str(tgt).lower())
-        entities = tuple(str(e).lower() for e in block.get("entities", []))
-        return (family, entities)
-
-    def _merge_blocks_preserving_derive(self, blocks: list) -> list:
-        seen = set()
-        merged = []
-        for block in blocks:
-            key = self._block_key(block)
-            if key in seen:
-                continue
-            seen.add(key)
-            merged.append(block)
-        return merged
-
-    @staticmethod
-    def _public_blocks(blocks: list) -> list:
-        public = []
-        for i, block in enumerate(blocks, start=1):
-            item = {
-                "index": i,
-                "family": block.get("family"),
-                "entities": block.get("entities", []),
-                "roles": block.get("roles", {}),
-                "source": block.get("source_clause", ""),
-                "confidence": block.get("confidence"),
-            }
-            if block.get("derived"):
-                item["derived"] = True
-                item["derive_source"] = block.get("derive_source")
-            public.append(item)
-        return public
-
-    def _attach_block_output(self, merged: dict, blocks: list) -> None:
-        public = self._public_blocks(blocks)
-        merged["blocks"] = public
-        merged["derived_blocks"] = [b for b in public if b.get("derived")]
-        merged["n_derived_blocks"] = len(merged["derived_blocks"])
-
-    @staticmethod
-    def _attach_v3_root_blockers(merged: dict, v3_result: Optional[dict]) -> None:
-        if not v3_result:
-            merged["v3_root_blockers"] = []
-            return
-        merged["v3_root_blockers"] = [
-            {
-                "name": rb.get("name", rb.get("entity", "")),
-                "entity": rb.get("entity", ""),
-                "impact": rb.get("impact", 0),
-            }
-            for rb in v3_result.get("root_blockers", [])
-        ]
-
-    @staticmethod
-    def _append_v252_trace_sections(merged: dict) -> None:
-        lines = [merged.get("trace", "").rstrip()]
-
-        v3_roots = merged.get("v3_root_blockers", [])
-        if v3_roots:
-            lines.append("")
-            lines.append("V3 ROOT BLOCKERS (neural perception):")
-            for i, rb in enumerate(v3_roots, start=1):
-                name = rb.get("name", rb.get("entity", ""))
-                impact = rb.get("impact", 0)
-                lines.append(f"  V3 [{i}]: {name} (impact={impact})")
-
-        derived = merged.get("derived_assumptions", [])
-        meta = merged.get("derive_meta", {})
-        lines.append("")
-        lines.append("DERIVED ASSUMPTIONS (v3 13.7M closure):")
-        if derived:
-            for pair in derived:
-                lines.append(f"  {pair.get('assuming')} => {pair.get('premise')}")
-        else:
-            lines.append("  None")
-        lines.append(
-            "  "
-            f"strategy={meta.get('strategy')} "
-            f"edge_source={meta.get('edge_source')} "
-            f"n_edges={meta.get('n_edges')} "
-            f"n_entities={meta.get('n_entities')}"
-        )
-
-        derived_blocks = merged.get("derived_blocks", [])
-        lines.append("")
-        lines.append(
-            "BLOCK OUTPUT: "
-            f"{merged.get('n_blocks', 0)} total, "
-            f"{len(derived_blocks)} derived"
-        )
-        if derived_blocks:
-            for block in derived_blocks[:12]:
-                lines.append(
-                    f"  [{block.get('index')}] {block.get('source')}"
-                )
-            if len(derived_blocks) > 12:
-                lines.append(f"  ... {len(derived_blocks) - 12} more derived blocks")
-
-        merged["trace"] = "\n".join(lines)
-
-    @staticmethod
-    def _dedupe_edges(edges: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
-        seen = set()
-        unique = []
-        for src, tgt in edges:
-            if not src or not tgt:
-                continue
-            pair = (str(src), str(tgt))
-            if pair not in seen:
-                seen.add(pair)
-                unique.append(pair)
-        return unique
-
-    @staticmethod
-    def _exact_derived_pairs(edges: List[Tuple[str, str]]) -> set:
-        unique_edges = ReasoningEngineV252._dedupe_edges(edges)
-        direct_set = set(unique_edges)
-        adj: Dict[str, set] = {}
-        for src, tgt in unique_edges:
-            adj.setdefault(src, set()).add(tgt)
-
-        derived = set()
-        for start in list(adj.keys()):
-            frontier = deque([(start, 0)])
-            visited = {start}
-            while frontier:
-                node, depth = frontier.popleft()
-                for nxt in adj.get(node, set()):
-                    if nxt not in visited:
-                        visited.add(nxt)
-                        frontier.append((nxt, depth + 1))
-                        pair = (start, nxt)
-                        if depth + 1 >= 2 and pair not in direct_set:
-                            derived.add(pair)
-        return derived
-
-    def _derive_assumptions_spoonfed(
-        self,
-        edges: List[Tuple[str, str]],
-    ) -> Tuple[List[Tuple[str, str]], dict]:
-        """
-        Transitive-closure assumptions from the 13.7M model's dedicated E4 expert.
-
-        The closure is computed end-to-end in the network (Pass B / family-5 routing
-        to E4) via ReasoningEngineV3.derive_assumptions(); no separate parametric
-        expert and no BFS oracle stand in for the neural output. Only genuinely
-        transitive pairs (closure minus the direct edges) are returned.
-        """
-        unique_edges = self._dedupe_edges(edges)
-        direct_set = set(unique_edges)
-        entity_set = {name for edge in unique_edges for name in edge}
-
-        meta = {
-            "n_edges": len(unique_edges),
-            "n_entities": len(entity_set),
-            "strategy": "none" if not unique_edges else "e4_closure",
-            "source": "13_7m_v4_E4",
-            "assumption_verdict": None,
-        }
-
-        if not unique_edges:
-            return [], meta
-
-        closure_pairs, verdict = self._v3.derive_assumptions(unique_edges)
-        meta["assumption_verdict"] = verdict
-        derived = sorted(pair for pair in closure_pairs if pair not in direct_set)
-        if not derived:
-            meta["strategy"] = "e4_closure_empty"
-        return derived, meta
-
-    @staticmethod
-    def _dependency_edges_from_v3(v3_result: Optional[dict]) -> List[Tuple[str, str]]:
-        if not v3_result:
-            return []
-
-        edges: List[Tuple[str, str]] = []
-        for dep in v3_result.get("dependencies", []):
-            src = dep.get("src_name", dep.get("src", ""))
-            tgt = dep.get("tgt_name", dep.get("tgt", ""))
-            if src and tgt:
-                edges.append((str(src), str(tgt)))
-        return edges
-
-    @staticmethod
-    def _dependency_edges_from_blocks(blocks: list) -> List[Tuple[str, str]]:
-        edges: List[Tuple[str, str]] = []
-        for block in blocks:
-            if block.get("family") != "dependency":
-                continue
-            roles = block.get("roles", {})
-            src = roles.get("blocked", "")
-            tgt = roles.get("blocker", "")
-            if not src or not tgt:
-                entities = block.get("entities", [])
-                if len(entities) >= 2:
-                    src, tgt = entities[0], entities[1]
-            if src and tgt:
-                edges.append((str(src), str(tgt)))
-        return edges
-
-    def _append_derived_dependency_blocks(
-        self,
-        blocks: list,
-        v3_result: Optional[dict],
-        source_edges: Optional[List[Tuple[str, str]]] = None,
-    ) -> list:
-        """
-        Feed 13.7M model assumptions into the normal V2 block pipeline.
-
-        V3 still owns perception.  The 13.7M model derives transitive
-        assumptions from V3 dependency edges.  Those assumptions are appended as
-        ordinary dependency blocks before _run_v2(), so root blockers, unlock
-        order, critical path, and parallel-work heuristics are computed by the
-        same block machinery as the core engine.
-        """
-        if not v3_result and not source_edges:
-            return list(blocks)
-
-        edges = self._dependency_edges_from_v3(v3_result)
-        # Caller-declared edges are ground truth for structured blocks: prefer them
-        # whenever present (re-perceived v3 edges can drift OOD on large prompts).
-        if source_edges:
-            edges = list(source_edges)
-        elif not edges:
-            edges = []
-
-        if not edges:
-            return list(blocks)
-
-        direct_set = set(self._dedupe_edges(edges))
-        derived_edges, _derive_meta = self._derive_assumptions_spoonfed(edges)
-
-        enriched_blocks = list(blocks)
-        for src, tgt in derived_edges:
-            if (src, tgt) in direct_set:
-                continue
-            enriched_blocks.append({
-                "family": "dependency",
-                "entities": [src, tgt],
-                "roles": {"blocked": src, "blocker": tgt},
-                "source_clause": (
-                    f"{src} transitively depends on {tgt} "
-                    "(derived by 13.7M MoE E4 closure)"
-                ),
-                "confidence": 0.78,
-                "derived": True,
-                "derive_source": "13_7m_v4_E4",
-            })
-
-        return enriched_blocks
-
-    # ── Derive enrichment ─────────────────────────────────────────────────────
-
-    def _enrich_with_derive(
-        self,
-        merged: dict,
-        v3_result: Optional[dict] = None,
-    ) -> dict:
-        """
-        Additive enrichment: writes derived_assumptions + derive_meta.
-
-        Edge source priority:
-          1. v3_result["dependencies"]  (full mode; explicit src_name/tgt_name)
-          2. merged["dependencies"]     (if caller stored it; same schema)
-          3. unlock_sequence chain      (lite mode; consecutive step pairs)
-
-        Strategy:
-          spoon-fed 2-hop 13.7M model windows, guarded by exact traversal
-
-        Never raises. Never removes or modifies existing keys.
-        """
-        # ── 1. Extract edges ──────────────────────────────────────────────────
-        edges: List[Tuple[str, str]] = []
-
-        # Full mode: explicit dependency list from v3_result or merged
-        dep_source = None
-        if v3_result is not None:
-            dep_source = v3_result.get("dependencies", [])
-        elif "dependencies" in merged:
-            dep_source = merged.get("dependencies", [])
-
-        if dep_source:
-            for dep in dep_source:
-                src = dep.get("src_name", dep.get("src", ""))
-                tgt = dep.get("tgt_name", dep.get("tgt", ""))
-                if src and tgt:
-                    edges.append((str(src), str(tgt)))
-
-        # Last-resort edge reconstruction for direct analyze_blocks() callers
-        # that supplied blocks but no dependency list was preserved in merged.
-        if not edges:
-            seq = merged.get("unlock_sequence", [])
-            if seq:
-                sorted_seq = sorted(seq, key=lambda x: x.get("step", 0))
-                names = [
-                    item.get("name", item.get("entity", ""))
-                    for item in sorted_seq
+        if conditional:
+            conditionals.append(
+                [
+                    _clean(conditional.group(1)),
+                    _clean(conditional.group(2)),
+                    _clean(conditional.group(3)) if conditional.group(3) else "",
                 ]
-                names = [n for n in names if n]
-                for i in range(len(names) - 1):
-                    edges.append((names[i], names[i + 1]))
+            )
+            continue
 
-        edge_src_label = (
-            "v3_dependencies" if (v3_result is not None and dep_source)
-            else "merged_dependencies" if dep_source
-            else "unlock_sequence_chain"
+        requirement = re.fullmatch(
+            r"(.+?)\s+must be\s+(at least|at most|exactly)\s+"
+            r"(-?\d+(?:\.\d+)?)",
+            statement,
+            re.IGNORECASE,
         )
+        if requirement:
+            requirements.append(
+                [
+                    _clean(requirement.group(1)),
+                    {
+                        "at least": "GEQ",
+                        "at most": "LEQ",
+                        "exactly": "EQ",
+                    }[requirement.group(2).lower()],
+                    requirement.group(3),
+                ]
+            )
+            continue
 
-        if not edges:
-            merged["derived_assumptions"] = []
-            merged["derive_meta"] = {
-                "n_edges": 0,
-                "n_entities": 0,
-                "strategy": "none",
-                "edge_source": edge_src_label,
-            }
-            return merged
+        conflict = re.fullmatch(
+            r"(.+?)\s+conflicts with\s+(.+)", statement, re.IGNORECASE
+        )
+        if conflict:
+            conflicts.add((_clean(conflict.group(1)), _clean(conflict.group(2))))
+            continue
 
-        # ── 2. Spoon-fed derive expert, guarded by exact traversal ──────────
-        unique_edges = self._dedupe_edges(edges)
-        derived_tuples, derive_meta = self._derive_assumptions_spoonfed(unique_edges)
-        derived_pairs = [
-            {"assuming": src, "premise": tgt}
-            for src, tgt in derived_tuples
-        ]
+        dependency = re.fullmatch(
+            r"(.+?)\s+depends on\s+(.+)", statement, re.IGNORECASE
+        )
+        if dependency:
+            dependencies.add(
+                (_clean(dependency.group(1)), _clean(dependency.group(2)))
+            )
+            continue
 
-        # ── 5. Write additive keys only ───────────────────────────────────────
-        merged["derived_assumptions"] = derived_pairs
-        derive_meta["edge_source"] = edge_src_label
-        merged["derive_meta"] = derive_meta
-        return merged
+        rejected.append(statement)
 
-    # ── Info ──────────────────────────────────────────────────────────────────
+    if rejected:
+        preview = "; ".join(repr(item) for item in rejected[:3])
+        more = f" (+{len(rejected) - 3} more)" if len(rejected) > 3 else ""
+        raise FormError(
+            "Input is not a valid pre-reasoning form. "
+            f"Unrecognized statement(s): {preview}{more}. "
+            "Call get_form() for the exact contract and retry the returned form.",
+            form_text=text,
+        )
+    return dependencies, conflicts, requirements, conditionals
+
+
+def _adjacency(dependencies: Iterable[tuple[str, str]]):
+    graph: dict[str, set[str]] = defaultdict(set)
+    for dependent, prerequisite in dependencies:
+        graph[dependent].add(prerequisite)
+    return graph
+
+
+def _root_blockers(dependencies: set[tuple[str, str]]) -> list[str]:
+    dependents = {source for source, _ in dependencies}
+    return sorted({target for _, target in dependencies if target not in dependents})
+
+
+def _unlock_plan(
+    dependencies: set[tuple[str, str]],
+) -> tuple[list[dict], list[dict]]:
+    """Render an exact topological schedule from model-verified direct edges."""
+    nodes = {entity for edge in dependencies for entity in edge}
+    prerequisites: dict[str, set[str]] = {node: set() for node in nodes}
+    dependents: dict[str, set[str]] = defaultdict(set)
+    for dependent, prerequisite in dependencies:
+        prerequisites[dependent].add(prerequisite)
+        dependents[prerequisite].add(dependent)
+
+    remaining = {node: set(values) for node, values in prerequisites.items()}
+    ready = sorted(node for node, values in remaining.items() if not values)
+    sequence: list[dict] = []
+    parallel: list[dict] = []
+    emitted: set[str] = set()
+    step = 1
+    while ready:
+        layer = [node for node in ready if node not in emitted]
+        if not layer:
+            break
+        if len(layer) > 1:
+            parallel.append({"step": step, "entities": layer})
+        for node in layer:
+            sequence.append({"step": step, "entity": node, "name": node})
+            emitted.add(node)
+        next_ready: set[str] = set()
+        for node in layer:
+            for dependent in dependents.get(node, ()):
+                remaining[dependent].discard(node)
+                if not remaining[dependent] and dependent not in emitted:
+                    next_ready.add(dependent)
+        ready = sorted(next_ready)
+        step += 1
+    return sequence, parallel
+
+
+def form_spec() -> dict:
+    """Return the stable contract intended for an outer AI."""
+    return {
+        "engine": "Pre-Reasoning V4",
+        "version": V4ReasoningEngine.VERSION,
+        "purpose": (
+            "The calling AI externalizes its interpretation, receives an "
+            "independent structural trace, and uses that trace in a new forward pass."
+        ),
+        "workflow": [
+            "Interpret the user's language yourself.",
+            "Write only facts supported by the user's context in the structured form.",
+            "Call analyze_form(form_text).",
+            "Read the returned trace alongside the original problem before answering.",
+        ],
+        "rules": [
+            "Preserve entity names exactly and use them consistently.",
+            "Use one structured statement per line.",
+            "Do not send raw prose, explanations, or guessed relationships.",
+            "Omit an uncertain relationship instead of inventing one.",
+        ],
+        "minimum_blocks": MIN_FORM_BLOCKS,
+        "minimum_block_alarm": SHORT_FORM_ALARM,
+        "template": FORM_TEMPLATE,
+        "families": {
+            "dependency": "<dependent> depends on <prerequisite>.",
+            "conflict": "<entity> conflicts with <entity>.",
+            "requirement_geq": "<entity> must be at least <number>.",
+            "requirement_leq": "<entity> must be at most <number>.",
+            "requirement_eq": "<entity> must be exactly <number>.",
+            "conditional": (
+                "If <condition> passes, then <consequence> can proceed, "
+                "otherwise <alternative> must proceed."
+            ),
+        },
+    }
+
+
+class V4ReasoningEngine:
+    """External pre-reasoner backed by the strictly loaded 1M checkpoint."""
+
+    VERSION = "4.0.1"
+    params = MODEL_PARAMS
+
+    def __init__(self, checkpoint_path=None, device: str = "auto"):
+        self.model, self.config, self.model_meta = load_model(
+            checkpoint_path, device=device
+        )
+        self.device = str(self.model.get_device())
+        self.checkpoint_path = self.model_meta["checkpoint"]
+        self._inference_cache: dict[tuple[str, str], str] = {}
+        self._model_calls: list[dict[str, str]] = []
+        self._operation_counts: Counter[str] = Counter()
+        self._execution_counts: Counter[str] = Counter()
+        self._last_result: dict | None = None
+
+    @property
+    def mode(self) -> str:
+        return "form"
 
     def engine_info(self) -> dict:
-        base = super().engine_info()
         return {
-            "engine": "pre-reasoning",
+            "engine": "Pre-Reasoning V4",
             "version": self.VERSION,
-            "mode": base.get("mode", "full"),
-            "neural_perception": "active",
-            "graph_reasoning": "active",
-            "model": base.get("v3_model"),
-            "params": base.get("v3_params"),
-            "checkpoint": base.get("v3_checkpoint"),
-            "device": base.get("v3_device"),
-            "closure": {"engine": "built-in E4 expert", "neural": True},
+            "mode": self.mode,
+            "model": self.model_meta["variant_id"],
+            "params": self.params,
+            "checkpoint": self.checkpoint_path,
+            "device": self.device,
+            "strict_checkpoint_load": True,
         }
 
+    def get_form(self) -> dict:
+        return form_spec()
 
-# ── CLI ───────────────────────────────────────────────────────────────────────
+    def format_for_narrator(self) -> str:
+        if self._last_result is None:
+            return "--- PRE-REASONING TRACE (V4) ---\nNo form has been analyzed yet."
+        return self._last_result["trace"]
 
-def main():
-    import argparse
-    import json
+    def _minimum_form_alarm(self, form_text: str, block_count: int) -> dict:
+        reprompt = (
+            f"Reprompt with at least {MIN_FORM_BLOCKS} valid structured blocks. "
+            "Use the attached form template and call analyze_form(form_text) again."
+        )
+        trace = "\n".join(
+            [
+                "--- PRE-REASONING ALARM ---",
+                SHORT_FORM_ALARM,
+                (
+                    f"Only {block_count} valid structured block(s) were submitted; "
+                    f"at least {MIN_FORM_BLOCKS} are required."
+                ),
+                "",
+                "REPROMPT REQUIRED:",
+                reprompt,
+                "",
+                "ATTACHED FORM TEMPLATE:",
+                FORM_TEMPLATE.rstrip(),
+            ]
+        )
+        return {
+            "status": "REPROMPT_REQUIRED",
+            "alarm": SHORT_FORM_ALARM,
+            "message": reprompt,
+            "reprompt": reprompt,
+            "block_count": block_count,
+            "minimum_blocks": MIN_FORM_BLOCKS,
+            "submitted_form": form_text,
+            "attached_form": FORM_TEMPLATE,
+            "trace": trace,
+            "dependencies": [],
+            "conflicts": [],
+            "requirements": [],
+            "conditionals": [],
+            "derived": [],
+            "root_blockers": [],
+            "cycle": False,
+            "cycle_nodes": [],
+            "unlock_sequence": [],
+            "parallel_work": [],
+            "blocks": [],
+            "derived_blocks": [],
+            "n_blocks": block_count,
+            "n_derived_blocks": 0,
+            "params": self.params,
+            "model": "pre-reasoning-1m",
+            "version": self.VERSION,
+            "mode": self.mode,
+            "neural_verified": False,
+            "neural_checks": [],
+            "neural_operations": {},
+            "neural_model_calls": 0,
+            "neural_cached_operations": 0,
+            "strict_checkpoint_load": True,
+            "inference_ms": 0.0,
+            "neural_enriched": False,
+            "grounding_level": "reprompt_required",
+            "has_cycle": False,
+        }
 
-    parser = argparse.ArgumentParser(
-        description="Pre-Reasoning v3.1.0, 13.7M neural engine"
-    )
-    parser.add_argument("text", nargs="?", help="Problem text to analyze")
-    parser.add_argument("--checkpoint", type=str, default=None)
-    parser.add_argument("--device", type=str, default="auto")
-    parser.add_argument("--info", action="store_true")
-    parser.add_argument("--json", action="store_true")
-    args = parser.parse_args()
-
-    engine = ReasoningEngineV252(checkpoint_path=args.checkpoint, device=args.device)
-
-    if args.info:
-        print(json.dumps(engine.engine_info(), indent=2))
-        return
-
-    if not args.text:
-        print("Usage: python -m pre_reasoning.engine 'A enables B. B enables C.'")
-        print("       python -m pre_reasoning.engine --info")
-        return
-
-    result = engine.analyze(args.text)
-
-    if args.json:
-        result.pop("trace", None)
-        print(json.dumps(result, indent=2, default=str))
-    else:
-        print(result.get("trace", ""))
-        print()
-        print("--- DERIVED ASSUMPTIONS (v3 closure) ---")
-        da = result.get("derived_assumptions", [])
-        dm = result.get("derive_meta", {})
-        if da:
-            for pair in da:
-                print(f"  {pair['assuming']} => {pair['premise']}")
+    def _complete(self, capability: str, prompt: str) -> str:
+        """Run one normalized learned operation through the checkpoint."""
+        self._operation_counts[capability] += 1
+        cache_key = (capability, prompt)
+        cache_hit = cache_key in self._inference_cache
+        if not cache_hit:
+            self._inference_cache[cache_key] = generate_completion(self.model, prompt)
+            self._execution_counts["model"] += 1
         else:
-            print("  (none)")
-        print(f"  strategy={dm.get('strategy')}  n_entities={dm.get('n_entities')}")
+            self._execution_counts["cache"] += 1
+        completion = self._inference_cache[cache_key]
+        if not any(call["capability"] == capability for call in self._model_calls):
+            self._model_calls.append(
+                {
+                    "capability": capability,
+                    "prompt": prompt,
+                    "completion": completion,
+                    "source": "cache" if cache_hit else "model",
+                }
+            )
+        return completion
+
+    @staticmethod
+    def _mapped_entity(value: str, bindings: dict[str, str]) -> str:
+        try:
+            return bindings[value]
+        except KeyError as exc:
+            raise NeuralContractError(
+                f"Model emitted an unbound placeholder: {value!r}"
+            ) from exc
+
+    def _model_dependency(self, dependent: str, prerequisite: str) -> tuple[str, str]:
+        prompt = f"{_ENTITY_A} needs {_ENTITY_B}. answer"
+        completion = self._complete("dependency", prompt)
+        match = re.fullmatch(
+            rf"\s*cycle\s+(yes|no)\.\s+therefore\s+"
+            rf"({re.escape(_ENTITY_A)}|{re.escape(_ENTITY_B)})\s+needs\s+"
+            rf"({re.escape(_ENTITY_A)}|{re.escape(_ENTITY_B)})\.",
+            completion,
+        )
+        if not match or match.group(1) != "no":
+            raise NeuralContractError(f"Invalid dependency completion: {completion!r}")
+        bindings = {_ENTITY_A: dependent, _ENTITY_B: prerequisite}
+        return (
+            self._mapped_entity(match.group(2), bindings),
+            self._mapped_entity(match.group(3), bindings),
+        )
+
+    def _model_assumption(
+        self, source: str, middle: str, target: str
+    ) -> tuple[str, str] | None:
+        prompt = (
+            f"{_ENTITY_A} needs {_ENTITY_B}. and "
+            f"{_ENTITY_B} needs {_ENTITY_C}. derive assumptions"
+        )
+        completion = self._complete("assumption", prompt)
+        if re.fullmatch(r"\s*assumption\s+no\.\s+therefore\s+none\.", completion):
+            return None
+        match = re.fullmatch(
+            rf"\s*assumption\s+yes\.\s+therefore\s+"
+            rf"({re.escape(_ENTITY_A)}|{re.escape(_ENTITY_B)}|{re.escape(_ENTITY_C)})"
+            rf"\s+needs\s+"
+            rf"({re.escape(_ENTITY_A)}|{re.escape(_ENTITY_B)}|{re.escape(_ENTITY_C)})\.",
+            completion,
+        )
+        if not match:
+            raise NeuralContractError(f"Invalid assumption completion: {completion!r}")
+        bindings = {_ENTITY_A: source, _ENTITY_B: middle, _ENTITY_C: target}
+        return (
+            self._mapped_entity(match.group(1), bindings),
+            self._mapped_entity(match.group(2), bindings),
+        )
+
+    def _model_cycle(self, left: str, right: str) -> bool:
+        prompt = (
+            f"{_ENTITY_A} needs {_ENTITY_B}. and "
+            f"{_ENTITY_B} needs {_ENTITY_A}. answer"
+        )
+        completion = self._complete("cycle", prompt)
+        match = re.fullmatch(
+            rf"\s*cycle\s+(yes|no)\.\s+therefore\s+"
+            rf"({re.escape(_ENTITY_A)}|{re.escape(_ENTITY_B)})\s+needs\s+"
+            rf"({re.escape(_ENTITY_A)}|{re.escape(_ENTITY_B)})\.",
+            completion,
+        )
+        if not match:
+            raise NeuralContractError(f"Invalid cycle completion: {completion!r}")
+        bindings = {_ENTITY_A: left, _ENTITY_B: right}
+        self._mapped_entity(match.group(2), bindings)
+        self._mapped_entity(match.group(3), bindings)
+        return match.group(1) == "yes"
+
+    def _model_conflict(self, left: str, right: str) -> tuple[str, str] | None:
+        prompt = f"{_ENTITY_A} conflicts with {_ENTITY_B}. answer"
+        completion = self._complete("conflict", prompt)
+        if re.fullmatch(r"\s*conflict\s+no\.\s+therefore\s+none\.", completion):
+            return None
+        match = re.fullmatch(
+            rf"\s*conflict\s+yes\.\s+therefore\s+"
+            rf"({re.escape(_ENTITY_A)}|{re.escape(_ENTITY_B)})\s+conflicts with\s+"
+            rf"({re.escape(_ENTITY_A)}|{re.escape(_ENTITY_B)})\.",
+            completion,
+        )
+        if not match:
+            raise NeuralContractError(f"Invalid conflict completion: {completion!r}")
+        bindings = {_ENTITY_A: left, _ENTITY_B: right}
+        return (
+            self._mapped_entity(match.group(1), bindings),
+            self._mapped_entity(match.group(2), bindings),
+        )
+
+    def _model_requirement(
+        self, entity: str, operator: str, original_value: str
+    ) -> list[str] | None:
+        phrases = {
+            "GEQ": ("at least", "17", _ENTITY_A),
+            "LEQ": ("at most", "23", _ENTITY_B),
+            "EQ": ("exactly", "31", _ENTITY_C),
+        }
+        phrase, canonical_value, placeholder = phrases[operator]
+        capability = f"requirement_{operator.lower()}"
+        prompt = f"{placeholder} must be {phrase} {canonical_value}. answer"
+        completion = self._complete(capability, prompt)
+        if re.fullmatch(r"\s*requirement\s+no\.\s+therefore\s+none\.", completion):
+            return None
+        match = re.fullmatch(
+            rf"\s*requirement\s+yes\.\s+therefore\s+"
+            rf"({re.escape(placeholder)})\s+must be\s+"
+            r"(at least|at most|exactly)\s+(-?\d+(?:\.\d+)?)\.",
+            completion,
+        )
+        if not match:
+            raise NeuralContractError(f"Invalid requirement completion: {completion!r}")
+        decoded_operator = {
+            "at least": "GEQ",
+            "at most": "LEQ",
+            "exactly": "EQ",
+        }[match.group(2)]
+        if decoded_operator != operator or match.group(3) != canonical_value:
+            raise NeuralContractError(f"Incorrect requirement completion: {completion!r}")
+        return [entity, decoded_operator, original_value]
+
+    def _model_conditional(
+        self, condition: str, consequence: str, otherwise: str
+    ) -> list[str] | None:
+        if otherwise:
+            capability = "conditional_else"
+            prompt = (
+                f"if {_ENTITY_A} passes, then {_ENTITY_B} can proceed, "
+                f"otherwise {_ENTITY_C} must proceed. answer"
+            )
+            pattern = (
+                rf"\s*conditional\s+yes\.\s+therefore\s+if\s+"
+                rf"({re.escape(_ENTITY_A)}|{re.escape(_ENTITY_B)}|{re.escape(_ENTITY_C)})"
+                rf"\s+then\s+"
+                rf"({re.escape(_ENTITY_A)}|{re.escape(_ENTITY_B)}|{re.escape(_ENTITY_C)})"
+                rf"\s+else\s+"
+                rf"({re.escape(_ENTITY_A)}|{re.escape(_ENTITY_B)}|{re.escape(_ENTITY_C)})\."
+            )
+        else:
+            capability = "conditional"
+            prompt = f"if {_ENTITY_A} passes, then {_ENTITY_B} can proceed. answer"
+            pattern = (
+                rf"\s*conditional\s+yes\.\s+therefore\s+if\s+"
+                rf"({re.escape(_ENTITY_A)}|{re.escape(_ENTITY_B)})\s+then\s+"
+                rf"({re.escape(_ENTITY_A)}|{re.escape(_ENTITY_B)})\."
+            )
+        completion = self._complete(capability, prompt)
+        if re.fullmatch(r"\s*conditional\s+no\.\s+therefore\s+none\.", completion):
+            return None
+        match = re.fullmatch(pattern, completion)
+        if not match:
+            raise NeuralContractError(f"Invalid conditional completion: {completion!r}")
+        bindings = {
+            _ENTITY_A: condition,
+            _ENTITY_B: consequence,
+            _ENTITY_C: otherwise,
+        }
+        decoded = [
+            self._mapped_entity(match.group(1), bindings),
+            self._mapped_entity(match.group(2), bindings),
+            "",
+        ]
+        if otherwise:
+            decoded[2] = self._mapped_entity(match.group(3), bindings)
+        return decoded
+
+    def _model_dependency_graph(
+        self, candidates: set[tuple[str, str]]
+    ) -> tuple[set[tuple[str, str]], set[tuple[str, str]], set[str]]:
+        direct = {
+            self._model_dependency(dependent, prerequisite)
+            for dependent, prerequisite in sorted(candidates)
+        }
+        known = set(direct)
+        derived: set[tuple[str, str]] = set()
+        cycle_nodes: set[str] = set()
+        while True:
+            additions: set[tuple[str, str]] = set()
+            snapshot = sorted(known)
+            for source, middle in snapshot:
+                if source == middle:
+                    continue
+                for next_source, target in snapshot:
+                    if next_source != middle or middle == target:
+                        continue
+                    if source == target:
+                        if self._model_cycle(source, middle):
+                            cycle_nodes.update((source, middle))
+                        continue
+                    if (source, target) in known:
+                        continue
+                    conclusion = self._model_assumption(source, middle, target)
+                    if conclusion is not None:
+                        additions.add(conclusion)
+            additions -= known
+            if not additions:
+                break
+            known.update(additions)
+            derived.update(additions)
+        return direct, derived, cycle_nodes
+
+    def analyze_form(
+        self, form_text: str, *, _enforce_minimum: bool = True
+    ) -> dict:
+        """Analyze the structured form written by the calling AI."""
+        if not isinstance(form_text, str):
+            raise TypeError("form_text must be a string")
+        started = time.perf_counter()
+        parsed = _parse_form(form_text)
+        parsed_dependencies, parsed_conflicts, parsed_requirements, parsed_conditionals = parsed
+        block_count = (
+            len(parsed_dependencies)
+            + len(parsed_conflicts)
+            + len(parsed_requirements)
+            + len(parsed_conditionals)
+        )
+        if _enforce_minimum and block_count < MIN_FORM_BLOCKS:
+            alarm = self._minimum_form_alarm(form_text, block_count)
+            alarm["inference_ms"] = round((time.perf_counter() - started) * 1000, 1)
+            return alarm
+        self._model_calls = []
+        self._operation_counts = Counter()
+        self._execution_counts = Counter()
+
+        dependencies, derived, cycle_nodes = self._model_dependency_graph(
+            parsed_dependencies
+        )
+        conflicts = {
+            decoded
+            for left, right in sorted(parsed_conflicts)
+            if (decoded := self._model_conflict(left, right)) is not None
+        }
+        requirements = [
+            decoded
+            for entity, operator, value in parsed_requirements
+            if (decoded := self._model_requirement(entity, operator, value)) is not None
+        ]
+        conditionals = [
+            decoded
+            for condition, consequence, otherwise in parsed_conditionals
+            if (
+                decoded := self._model_conditional(condition, consequence, otherwise)
+            )
+            is not None
+        ]
+        unlock_sequence, parallel_work = _unlock_plan(dependencies)
+        root_blockers = _root_blockers(dependencies)
+        blocks = self._build_blocks(
+            dependencies, conflicts, requirements, conditionals, derived
+        )
+        derived_blocks = [block for block in blocks if block.get("derived")]
+        checks = [call["capability"] for call in self._model_calls]
+        result = {
+            "dependencies": sorted([list(pair) for pair in dependencies]),
+            "conflicts": sorted([list(pair) for pair in conflicts]),
+            "requirements": sorted(requirements),
+            "conditionals": sorted(conditionals),
+            "derived": sorted([list(pair) for pair in derived]),
+            "root_blockers": root_blockers,
+            "cycle": bool(cycle_nodes),
+            "cycle_nodes": sorted(cycle_nodes),
+            "unlock_sequence": unlock_sequence,
+            "parallel_work": parallel_work,
+            "blocks": blocks,
+            "derived_blocks": derived_blocks,
+            "n_blocks": len(blocks),
+            "n_derived_blocks": len(derived_blocks),
+            "derived_assumptions": [
+                {"assuming": source, "premise": target}
+                for source, target in sorted(derived)
+            ],
+            "params": self.params,
+            "model": "pre-reasoning-1m",
+            "version": self.VERSION,
+            "mode": self.mode,
+            "neural_verified": bool(self._model_calls),
+            "neural_checks": checks,
+            "neural_operations": dict(sorted(self._operation_counts.items())),
+            "neural_model_calls": self._execution_counts["model"],
+            "neural_cached_operations": self._execution_counts["cache"],
+            "strict_checkpoint_load": True,
+            "inference_ms": round((time.perf_counter() - started) * 1000, 1),
+            "neural_enriched": True,
+            "grounding_level": "grounding" if blocks else "empty_form",
+            "has_cycle": bool(cycle_nodes),
+            "derive_meta": {
+                "strategy": "neural_compositional_windows",
+                "n_edges": len(dependencies),
+                "n_entities": len({entity for pair in dependencies for entity in pair}),
+                "edge_source": "decoded_model_output",
+                "form_source": "calling_ai",
+            },
+        }
+        result["trace"] = self._render_trace(result)
+        self._last_result = result
+        return result
+
+    @staticmethod
+    def _build_blocks(
+        dependencies, conflicts, requirements, conditionals, derived
+    ) -> list[dict]:
+        blocks: list[dict] = []
+
+        def append(block: dict) -> None:
+            item = dict(block)
+            item["index"] = len(blocks) + 1
+            item.setdefault("confidence", 1.0)
+            blocks.append(item)
+
+        for dependent, prerequisite in sorted(dependencies):
+            append(
+                {
+                    "family": "dependency",
+                    "entities": [dependent, prerequisite],
+                    "roles": {"dependent": dependent, "prerequisite": prerequisite},
+                    "source": f"{dependent} depends on {prerequisite}",
+                }
+            )
+        for left, right in sorted(conflicts):
+            append(
+                {
+                    "family": "conflict",
+                    "entities": [left, right],
+                    "roles": {"left": left, "right": right},
+                    "source": f"{left} conflicts with {right}",
+                }
+            )
+        for entity, operator, value in sorted(requirements):
+            append(
+                {
+                    "family": "requirement",
+                    "entities": [entity],
+                    "roles": {"entity": entity, "operator": operator, "value": value},
+                    "source": f"{entity} {operator} {value}",
+                }
+            )
+        for condition, consequence, otherwise in sorted(conditionals):
+            entities = [condition, consequence] + ([otherwise] if otherwise else [])
+            append(
+                {
+                    "family": "conditional",
+                    "entities": entities,
+                    "roles": {
+                        "condition": condition,
+                        "consequence": consequence,
+                        "otherwise": otherwise,
+                    },
+                    "source": f"if {condition} then {consequence}",
+                }
+            )
+        for source, target in sorted(derived):
+            append(
+                {
+                    "family": "dependency",
+                    "entities": [source, target],
+                    "roles": {"dependent": source, "prerequisite": target},
+                    "source": f"{source} transitively depends on {target}",
+                    "derived": True,
+                    "derive_source": "neural_compositional_windows",
+                }
+            )
+        return blocks
+
+    @staticmethod
+    def _render_trace(data: dict) -> str:
+        lines = [
+            "--- PRE-REASONING TRACE (V4) ---",
+            "External structural map for the calling AI's next forward pass.",
+            "Reconsider the original problem using this map before answering.",
+            "",
+        ]
+        if data["root_blockers"]:
+            lines.append("ROOT BLOCKERS:")
+            lines.extend(f"  - {name}" for name in data["root_blockers"])
+        else:
+            lines.append("ROOT BLOCKERS: None")
+
+        lines.extend(("", "UNLOCK SEQUENCE:"))
+        if data["unlock_sequence"]:
+            for item in data["unlock_sequence"]:
+                lines.append(f"  Step {item['step']}: {item['entity']}")
+        else:
+            lines.append("  None")
+
+        if data["parallel_work"]:
+            lines.extend(("", "PARALLEL WINDOWS:"))
+            for item in data["parallel_work"]:
+                lines.append(
+                    f"  Step {item['step']}: {', '.join(item['entities'])}"
+                )
+        if data["conflicts"]:
+            lines.extend(("", "CONFLICTS:"))
+            lines.extend(
+                f"  - {left} conflicts with {right}"
+                for left, right in data["conflicts"]
+            )
+        if data["requirements"]:
+            lines.extend(("", "REQUIREMENTS:"))
+            for entity, operator, value in data["requirements"]:
+                symbol = {"GEQ": ">=", "LEQ": "<=", "EQ": "="}[operator]
+                lines.append(f"  - {entity} {symbol} {value}")
+        if data["conditionals"]:
+            lines.extend(("", "CONDITIONALS:"))
+            for condition, consequence, otherwise in data["conditionals"]:
+                suffix = f" else {otherwise}" if otherwise else ""
+                lines.append(f"  - if {condition}, then {consequence}{suffix}")
+
+        lines.extend(("", "CYCLES:"))
+        if data["cycle"]:
+            lines.append(f"  - {', '.join(data['cycle_nodes'])}")
+        else:
+            lines.append("  None")
+
+        if data["derived"]:
+            lines.extend(("", "MODEL-DERIVED ASSUMPTIONS:"))
+            lines.extend(
+                f"  - {source} depends on {target}"
+                for source, target in data["derived"][:12]
+            )
+            extra = len(data["derived"]) - 12
+            if extra > 0:
+                lines.append(f"  ... {extra} more")
+        return "\n".join(lines)
+
+    def coverage_check_result(self, analysis: dict, response: str) -> dict:
+        """Run a lexical coverage check over an existing structural trace.
+
+        This helper checks textual presence only. It does not establish that the
+        response agrees with, resolves, or semantically addresses an obligation.
+        """
+        if analysis.get("status") == "REPROMPT_REQUIRED":
+            return analysis
+        if not isinstance(response, str):
+            raise TypeError("response must be a string")
+        response_lower = response.casefold()
+
+        def mentions(value: str) -> bool:
+            value = str(value).strip()
+            if not value:
+                return True
+            if re.fullmatch(r"-?\d+(?:\.\d+)?", value):
+                return bool(
+                    re.search(
+                        rf"(?<![\d.]){re.escape(value)}(?!(?:\d|\.\d))",
+                        response,
+                    )
+                )
+            return value.casefold() in response_lower
+
+        gaps: list[str] = []
+        root_blockers = list(analysis.get("root_blockers", []))
+        root_names = set(root_blockers)
+        for blocker in root_blockers:
+            if not mentions(blocker):
+                gaps.append(blocker)
+
+        for item in analysis.get("unlock_sequence", []):
+            entity = str(item.get("entity") or item.get("name") or "")
+            if entity and entity not in root_names and not mentions(entity):
+                gaps.append(f"unlock: {entity}")
+
+        for left, right in analysis.get("conflicts", []):
+            if not (mentions(left) and mentions(right)):
+                gaps.append(f"conflict: {left} <> {right}")
+
+        for entity, operator, value in analysis.get("requirements", []):
+            if not (mentions(entity) and mentions(value)):
+                gaps.append(f"requirement: {entity} {operator} {value}")
+
+        for condition, consequence, otherwise in analysis.get("conditionals", []):
+            terms = [condition, consequence] + ([otherwise] if otherwise else [])
+            if not all(mentions(term) for term in terms):
+                suffix = f" else {otherwise}" if otherwise else ""
+                gaps.append(
+                    f"conditional: if {condition} then {consequence}{suffix}"
+                )
+
+        if analysis.get("cycle"):
+            cycle_nodes = list(analysis.get("cycle_nodes", []))
+            names_present = all(mentions(node) for node in cycle_nodes)
+            cycle_named = "cycle" in response_lower or "circular" in response_lower
+            if not (names_present and cycle_named):
+                gaps.append(f"cycle: {', '.join(cycle_nodes)}")
+
+        return {
+            "status": "CONTINUE" if gaps else "COMPLETE",
+            "gaps": gaps,
+            "root_blockers": root_blockers,
+            "check_type": "lexical_coverage",
+            "semantic_verified": False,
+        }
+
+    def coverage_check(self, form_text: str, response: str, **_kwargs) -> dict:
+        """Analyze a form and run the non-semantic lexical coverage check."""
+        analysis = self.analyze_form(form_text)
+        return self.coverage_check_result(analysis, response)
+
+    def pulse_result(self, analysis: dict, response: str) -> dict:
+        """Compatibility alias for :meth:`coverage_check_result`."""
+        return self.coverage_check_result(analysis, response)
+
+    def pulse(
+        self, form_text: str, response: str | None = None, **_kwargs
+    ) -> dict:
+        """Run a fresh reasoning pass for a Focus Mode reflection checkpoint.
+
+        Passing ``response`` preserves the pre-v4.1 lexical-check behavior for
+        existing callers. New callers should use ``coverage_check`` explicitly.
+        """
+        if response is not None:
+            return self.coverage_check(form_text, response)
+        analysis = self.analyze_form(form_text)
+        if analysis.get("status") == "REPROMPT_REQUIRED":
+            return analysis
+        result = dict(analysis)
+        result["status"] = "FOCUS_PULSE_COMPLETE"
+        result["focus_mode"] = {
+            "mode": "focus",
+            "event": "reasoning_pulse",
+            "interval_minutes": FOCUS_INTERVAL_MINUTES,
+        }
+        result["reflection_prompt"] = FOCUS_REMINDER
+        return result
+
+    def analyze_blocks(self, blocks: list[dict], **_kwargs) -> dict:
+        """Analyze explicit structured blocks without interpreting their source prose."""
+        clauses: list[str] = []
+        operator_phrase = {"GEQ": "at least", "LEQ": "at most", "EQ": "exactly"}
+        for block in blocks:
+            family = str(block.get("family", "")).lower()
+            roles = block.get("roles", {}) or {}
+            entities = [str(value) for value in block.get("entities", [])]
+            if family in ("dependency", "prereq"):
+                dependent = roles.get("dependent") or roles.get("blocked")
+                prerequisite = roles.get("prerequisite") or roles.get("blocker")
+                if not dependent and len(entities) >= 2:
+                    dependent, prerequisite = entities[:2]
+                if dependent and prerequisite:
+                    clauses.append(f"{dependent} depends on {prerequisite}.")
+            elif family == "conflict":
+                left = roles.get("left") or roles.get("initiator")
+                right = roles.get("right") or roles.get("opposing")
+                if not left and len(entities) >= 2:
+                    left, right = entities[:2]
+                if left and right:
+                    clauses.append(f"{left} conflicts with {right}.")
+            elif family == "requirement":
+                entity = roles.get("entity") or (entities[0] if entities else "")
+                operator = str(roles.get("operator", "")).upper()
+                value = roles.get("value")
+                if entity and operator in operator_phrase and value is not None:
+                    clauses.append(
+                        f"{entity} must be {operator_phrase[operator]} {value}."
+                    )
+            elif family == "conditional":
+                condition = roles.get("condition")
+                consequence = roles.get("consequence")
+                otherwise = roles.get("otherwise", "")
+                if condition and consequence:
+                    clause = f"If {condition} passes, then {consequence} can proceed"
+                    if otherwise:
+                        clause += f", otherwise {otherwise} must proceed"
+                    clauses.append(clause + ".")
+            else:
+                raise FormError(f"Unsupported block family: {family!r}")
+        return self.analyze_form("\n".join(clauses))
+
+    def raw_generate(self, prompt: str, max_new_tokens: int = 192) -> str:
+        """Expose raw greedy generation for checkpoint diagnostics."""
+        return generate_completion(self.model, prompt, max_new_tokens)
 
 
-if __name__ == "__main__":
-    main()
+class FocusMode:
+    """Scheduler-backed reflection loop for an active work session.
+
+    The host should consume ``scheduler_request()`` and create a recurring task
+    in the current chat. ``check()`` remains a local fallback for hosts without
+    scheduling support. No background thread or sleep is created by this package.
+    """
+
+    def __init__(
+        self,
+        *,
+        interval_minutes: float = FOCUS_INTERVAL_MINUTES,
+        engine: V4ReasoningEngine | None = None,
+        checkpoint_path: str | None = None,
+        device: str = "auto",
+        clock: Callable[[], float] | None = None,
+    ):
+        interval_minutes = float(interval_minutes)
+        if interval_minutes <= 0:
+            raise ValueError("interval_minutes must be greater than zero")
+        self.interval_minutes = interval_minutes
+        self.interval_seconds = interval_minutes * 60.0
+        self._engine = engine
+        self._checkpoint_path = checkpoint_path
+        self._device = device
+        self._clock = clock or time.monotonic
+        self._last_pulse_at = float(self._clock())
+        self._pulse_count = 0
+        self._pulse_required = False
+
+    def _get_engine(self) -> V4ReasoningEngine:
+        if self._engine is None:
+            self._engine = V4ReasoningEngine(
+                self._checkpoint_path, device=self._device
+            )
+        return self._engine
+
+    def scheduler_request(self) -> dict:
+        """Return the model-facing request for a recurring in-chat pulse task."""
+        return _focus_scheduler_request(self.interval_minutes)
+
+    def check(self) -> dict:
+        """Return the current Focus Mode state without blocking or loading weights."""
+        elapsed = max(0.0, float(self._clock()) - self._last_pulse_at)
+        due = self._pulse_required or elapsed >= self.interval_seconds
+        remaining = 0.0 if due else max(0.0, self.interval_seconds - elapsed)
+        state = {
+            "status": "FOCUS_PULSE_DUE" if due else "FOCUS_MODE_ACTIVE",
+            "mode": "focus",
+            "event": "reasoning_pulse",
+            "due": due,
+            "interval_minutes": self.interval_minutes,
+            "elapsed_seconds": round(elapsed, 3),
+            "next_pulse_in_seconds": round(remaining, 3),
+            "pulse_count": self._pulse_count,
+            "reminder": FOCUS_REMINDER if due else None,
+            "scheduler_request": self.scheduler_request(),
+        }
+        if due:
+            state.update(
+                {
+                    "minimum_blocks": MIN_FORM_BLOCKS,
+                    "attached_form": FORM_TEMPLATE,
+                }
+            )
+        return state
+
+    def pulse(self, form_text: str | None = None, *, force: bool = False) -> dict:
+        """Run a due reflection pulse, or return the current timer state."""
+        state = self.check()
+        if form_text is None or (not state["due"] and not force):
+            return state
+
+        result = self._get_engine().pulse(form_text)
+        if result.get("status") == "REPROMPT_REQUIRED":
+            self._pulse_required = True
+            failed = dict(result)
+            failed["focus_mode"] = {
+                "mode": "focus",
+                "event": "reasoning_pulse",
+                "due": True,
+                "interval_minutes": self.interval_minutes,
+                "pulse_count": self._pulse_count,
+                "next_pulse_in_seconds": 0.0,
+            }
+            failed["reflection_prompt"] = FOCUS_REMINDER
+            return failed
+
+        self._last_pulse_at = float(self._clock())
+        self._pulse_count += 1
+        self._pulse_required = False
+        completed = dict(result)
+        completed["focus_mode"] = {
+            "mode": "focus",
+            "event": "reasoning_pulse",
+            "due": False,
+            "interval_minutes": self.interval_minutes,
+            "pulse_count": self._pulse_count,
+            "next_pulse_in_seconds": self.interval_seconds,
+        }
+        return completed
+
+
+ReasoningEngine = V4ReasoningEngine
+
+
+__all__ = [
+    "FOCUS_INTERVAL_MINUTES",
+    "FOCUS_REMINDER",
+    "FOCUS_SCHEDULER_PROMPT",
+    "FORM_TEMPLATE",
+    "FocusMode",
+    "FormError",
+    "MIN_FORM_BLOCKS",
+    "NeuralContractError",
+    "ReasoningEngine",
+    "SHORT_FORM_ALARM",
+    "V4ReasoningEngine",
+    "form_spec",
+]
